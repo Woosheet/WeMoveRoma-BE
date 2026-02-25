@@ -1,0 +1,32 @@
+services:
+  gtfs-monitor:
+    image: eclipse-temurin:21-jre
+    container_name: gtfs-monitor
+    restart: unless-stopped
+
+    ports:
+      - "8080:8080"
+
+    volumes:
+      - ./app.jar:/app/app.jar:ro
+      - ./data/gtfs_static:/app/data/gtfs_static
+      - ./logs:/app/logs
+
+    environment:
+      SPRING_PROFILES_ACTIVE: "default"
+
+      LOGGING_FILE_NAME: "/app/logs/app.log"
+
+      GTFS_STATIC_URL: "https://dati.comune.roma.it/catalog/dataset/a7dadb4a-66ae-4eff-8ded-a102064702ba/resource/266d82e1-ba53-4510-8a81-370880c4678f/download/rome_static_gtfs.zip"
+      GTFS_STATIC_DATADIR: "/app/data/gtfs_static"
+      GTFS_STATIC_REFRESHMILLIS: "3600000"
+
+      GTFS_REALTIME_TRIPUPDATESURL: "https://romamobilita.it/sites/default/files/rome_rtgtfs_trip_updates_feed.pb"
+      GTFS_REALTIME_VEHICLEPOSITIONSURL: "https://romamobilita.it/sites/default/files/rome_rtgtfs_vehicle_positions_feed.pb"
+      GTFS_REALTIME_SERVICEALERTSURL: "https://romamobilita.it/sites/default/files/rome_rtgtfs_service_alerts_feed.pb"
+
+      JAVA_OPTS: "-Xms512m -Xmx1g"
+
+    entrypoint: >
+      sh -c "java $JAVA_OPTS -jar /app/app.jar --server.port=8080"
+      

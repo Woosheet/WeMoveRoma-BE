@@ -1,0 +1,358 @@
+{
+  "info": {
+    "_postman_id": "6aee6fe8-4a6c-4c24-a41d-9d5f8f0c9a31",
+    "name": "GTFS Monitor Local Tests",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "Richieste locali per testare gtfs-monitor in Insomnia (importa come Postman Collection)."
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health (Actuator)",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/actuator/health",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "actuator",
+            "health"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Trip Updates",
+      "item": [
+        {
+          "name": "All",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/trip-updates",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "trip-updates"
+              ]
+            }
+          }
+        },
+        {
+          "name": "With limit",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/trip-updates?limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "trip-updates"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "By routeId",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/trip-updates?routeId=64&limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "trip-updates"
+              ],
+              "query": [
+                {
+                  "key": "routeId",
+                  "value": "64"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Limit cap test",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/trip-updates?limit=999999",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "trip-updates"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "999999"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Vehicle Positions",
+      "item": [
+        {
+          "name": "All",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/vehicle-positions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "vehicle-positions"
+              ]
+            }
+          }
+        },
+        {
+          "name": "With limit",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/vehicle-positions?limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "vehicle-positions"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "By routeId",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/vehicle-positions?routeId=64&limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "vehicle-positions"
+              ],
+              "query": [
+                {
+                  "key": "routeId",
+                  "value": "64"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Limit cap test",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/vehicle-positions?limit=999999",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "vehicle-positions"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "999999"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Service Alerts",
+      "item": [
+        {
+          "name": "Today (default)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/service-alerts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "service-alerts"
+              ]
+            }
+          }
+        },
+        {
+          "name": "With limit",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/service-alerts?limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "service-alerts"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "By routeId",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/service-alerts?routeId=64&limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "service-alerts"
+              ],
+              "query": [
+                {
+                  "key": "routeId",
+                  "value": "64"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "By date range",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/service-alerts?from=2026-02-24&to=2026-02-26",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "service-alerts"
+              ],
+              "query": [
+                {
+                  "key": "from",
+                  "value": "2026-02-24"
+                },
+                {
+                  "key": "to",
+                  "value": "2026-02-26"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "By stopId (example)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/service-alerts?stopId=70001&limit=20",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "service-alerts"
+              ],
+              "query": [
+                {
+                  "key": "stopId",
+                  "value": "70001"
+                },
+                {
+                  "key": "limit",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Limit cap test",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/service-alerts?limit=999999",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "service-alerts"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "999999"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
