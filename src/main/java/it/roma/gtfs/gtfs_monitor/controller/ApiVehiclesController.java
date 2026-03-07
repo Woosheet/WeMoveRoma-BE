@@ -52,10 +52,23 @@ public class ApiVehiclesController {
     }
 
     @GetMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter streamVehicles() {
-        var snapshot = vehiclePositionsService.fetch(null, null, null);
+    public SseEmitter streamVehicles(
+            @RequestParam(required = false) String linea,
+            @RequestParam(required = false) String destination,
+            @RequestParam(required = false) String vehicleId
+    ) {
+        var snapshot = vehiclePositionsService.fetch(linea, destination, null);
+        if (vehicleId != null && !vehicleId.isBlank()) {
+            snapshot = snapshot.stream().filter(v -> vehicleId.equals(v.getVeicolo())).toList();
+        }
         Instant generatedAt = vehiclePositionsService.lastSnapshotAt();
-        return vehiclePositionsSseService.subscribe(snapshot, generatedAt != null ? generatedAt : Instant.now());
+        return vehiclePositionsSseService.subscribe(
+                snapshot,
+                generatedAt != null ? generatedAt : Instant.now(),
+                linea,
+                destination,
+                vehicleId
+        );
     }
 
     private ApiVehicleDTO toApiDto(VehiclePositionDTO dto) {
@@ -67,7 +80,9 @@ public class ApiVehiclesController {
                 dto.getLat(),
                 dto.getLon(),
                 dto.getVelocitaKmh(),
-                dto.getTimestamp()
+                dto.getTimestamp(),
+                dto.getOccupancyStatus(),
+                dto.getWheelchairAccessible()
         );
     }
 

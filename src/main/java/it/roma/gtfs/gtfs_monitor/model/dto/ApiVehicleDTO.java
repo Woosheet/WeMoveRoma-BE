@@ -8,6 +8,8 @@ public record ApiVehicleDTO(
         Double lat,
         Double lon,
         Double speedKmh,
-        String lastUpdateAt
+        String lastUpdateAt,
+        String occupancyStatus,
+        Boolean wheelchairAccessible
 ) {
 }

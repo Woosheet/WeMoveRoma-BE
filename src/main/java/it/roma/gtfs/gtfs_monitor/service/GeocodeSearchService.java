@@ -50,7 +50,8 @@ public class GeocodeSearchService {
                     int score = rankResult(q, row, normalizedLabel, biasLat, biasLon);
                     score += queryIndex * 35; // query originale sempre preferita rispetto ai fallback
 
-                    RankedResult candidate = new RankedResult(new GeocodeSearchResultDTO(lat, lon, normalizedLabel), score);
+                    String poiName = extractPoiDisplayName(row, normalizedLabel);
+                    RankedResult candidate = new RankedResult(new GeocodeSearchResultDTO(lat, lon, normalizedLabel, poiName), score);
                     RankedResult prev = dedup.get(key);
                     if (prev == null || candidate.score < prev.score) {
                         dedup.put(key, candidate);
@@ -79,6 +80,7 @@ public class GeocodeSearchService {
                         .queryParam("q", query)
                         .queryParam("limit", upstreamLimit)
                         .queryParam("addressdetails", 1)
+                        .queryParam("namedetails", 1)
                         .queryParam("accept-language", "it")
                         .queryParam("countrycodes", "it")
                         .queryParam("viewbox", "%s,%s,%s,%s".formatted(ROME_MIN_LON, ROME_MAX_LAT, ROME_MAX_LON, ROME_MIN_LAT))
@@ -175,6 +177,7 @@ public class GeocodeSearchService {
         String qStreet = normalizeStreetQuery(query);
         String roadNorm = normalizeKey(road);
         String houseNorm = normalizeHouseNumber(houseNumber);
+        String qHouseNorm = normalizeHouseNumber(qHouse);
 
         if (qStreet != null && !qStreet.isBlank()) {
             if (roadNorm.equals(qStreet)) score -= 350;
@@ -182,10 +185,10 @@ public class GeocodeSearchService {
             else if (roadNorm.contains(qStreet)) score -= 120;
         }
 
-        if (qHouse != null) {
-            if (houseNorm != null && houseNorm.equals(normalizeHouseNumber(qHouse))) {
+        if (qHouseNorm != null) {
+            if (houseNorm != null && houseNorm.equals(qHouseNorm)) {
                 score -= 500;
-            } else if (houseNorm != null && normalizeHouseNumber(qHouse).startsWith(houseNorm)) {
+            } else if (houseNorm != null && qHouseNorm.startsWith(houseNorm)) {
                 score -= 120;
             } else {
                 // Query contiene civico ma il risultato non lo ha: penalizza molto.
@@ -195,6 +198,21 @@ public class GeocodeSearchService {
 
         if (l.startsWith(q)) score -= 300;
         if (l.contains(q)) score -= 120;
+
+        // Boost match on POI/commercial names (e.g. "Carrefour Market", "Conad City")
+        // without changing the displayed address label.
+        String poiName = extractPoiDisplayName(row, label);
+        String poiNorm = normalizeKey(poiName);
+        if (!q.isBlank() && poiNorm != null && !poiNorm.isBlank()) {
+            if (poiNorm.equals(q)) {
+                score -= 320;
+            } else if (poiNorm.startsWith(q)) {
+                score -= 240;
+            } else if (poiNorm.contains(q)) {
+                score -= 140;
+            }
+        }
+
         if (l.contains("roma")) score -= 40;
         if (l.contains("municipio")) score -= 10;
         score += Math.abs(l.length() - q.length()) / 4;
@@ -204,7 +222,11 @@ public class GeocodeSearchService {
             Double lon = parseDouble(row.get("lon"));
             if (lat != null && lon != null) {
                 int meters = haversineMeters(biasLat, biasLon, lat, lon);
-                score += Math.min(220, meters / 60); // bias morbido: privilegia risultati vicini senza rompere il civico
+                // Per POI/ricerche generiche (bar, supermercato, ecc.) la vicinanza deve pesare di più.
+                // Per indirizzi manteniamo un bias morbido per non rompere il matching via/civico.
+                score += looksLikeAddressQuery(query)
+                        ? Math.min(220, meters / 60)
+                        : Math.min(420, meters / 35);
             }
         }
         return score;
@@ -224,6 +246,15 @@ public class GeocodeSearchService {
                 .replaceAll("(?i)\\bl\\.go\\b", "largo")
                 .replaceAll("(?i)\\bstaz\\.ne\\b", "stazione");
         variants.add(expanded);
+
+        String baseToken = normalizeKey(expanded);
+        if (baseToken.equals("carrefour")) {
+            variants.add("carrefour market");
+            variants.add("carrefour express");
+        } else if (baseToken.equals("conad")) {
+            variants.add("conad city");
+            variants.add("conad superstore");
+        }
 
         String withRoma = expanded.toLowerCase().contains("roma") ? expanded : (expanded + " Roma");
         variants.add(withRoma);
@@ -273,6 +304,47 @@ public class GeocodeSearchService {
         if (value == null) return null;
         String out = value.toLowerCase().replaceAll("\\s+", "");
         return out.isBlank() ? null : out;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String extractPoiDisplayName(Map<String, Object> row, String normalizedLabel) {
+        String direct = toStringOrNull(row.get("name"));
+        Object namedetailsObj = row.get("namedetails");
+        String named = null;
+        if (namedetailsObj instanceof Map<?, ?> raw) {
+            Map<String, Object> namedetails = (Map<String, Object>) raw;
+            named = firstNonBlank(
+                    toStringOrNull(namedetails.get("name:it")),
+                    toStringOrNull(namedetails.get("official_name")),
+                    toStringOrNull(namedetails.get("name"))
+            );
+        }
+        String candidate = firstNonBlank(named, direct);
+        if (candidate == null) return null;
+        String c = candidate.trim();
+        if (c.isBlank()) return null;
+        // Avoid redundant titles when the "name" is basically the same as the compact address label.
+        String cNorm = normalizeKey(c);
+        String lNorm = normalizeKey(normalizedLabel);
+        if (cNorm.isBlank() || cNorm.equals(lNorm) || lNorm.startsWith(cNorm + " ")) {
+            return null;
+        }
+        return c;
+    }
+
+    private static boolean looksLikeAddressQuery(String query) {
+        if (query == null) return false;
+        String q = query.toLowerCase(Locale.ROOT).trim();
+        if (q.isBlank()) return false;
+        if (q.matches(".*\\d+[a-z]{0,3}.*")) return true;
+        return q.contains("via ")
+                || q.contains("viale ")
+                || q.contains("piazza ")
+                || q.contains("largo ")
+                || q.contains("corso ")
+                || q.contains("vicolo ")
+                || q.contains("lungotevere ")
+                || q.contains("circonvallazione ");
     }
 
     private static String normalizeKey(String value) {

@@ -8,6 +8,9 @@ public record NearbyArrivalDTO(
         String stopName,
         String arrivalTime,
         String departureTime,
-        Integer etaMinutes
+        Integer etaMinutes,
+        Boolean hasLivePosition,
+        String occupancyStatus,
+        Boolean wheelchairAccessible
 ) {
 }

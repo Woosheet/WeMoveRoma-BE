@@ -115,6 +115,26 @@ public class VehiclePositionsService {
     }
 
     private List<VehiclePositionDTO> fetchRemoteSnapshot() {
+        try {
+            return fetchRemoteSnapshotOnce();
+        } catch (InvalidProtocolBufferException pe) {
+            log.warn("[VehiclePositions] protobuf corrotto (tentativo 1), retry immediato: {}", pe.toString());
+            try {
+                return fetchRemoteSnapshotOnce();
+            } catch (InvalidProtocolBufferException retryPe) {
+                log.error("[VehiclePositions] feed protobuf corrotto anche al retry: {}", retryPe.toString());
+                return List.of();
+            } catch (Exception retryEx) {
+                log.error("[VehiclePositions] retry fallito: {}", retryEx.toString());
+                return List.of();
+            }
+        } catch (Exception e) {
+            log.error("[VehiclePositions] fetch/parsing error: {}", e.toString());
+            return List.of();
+        }
+    }
+
+    private List<VehiclePositionDTO> fetchRemoteSnapshotOnce() throws InvalidProtocolBufferException {
         String url = Objects.requireNonNull(props.realtime().vehiclePositionsUrl(),
                 "gtfs.realtime.vehiclePositionsUrl mancante");
 
@@ -129,54 +149,56 @@ public class VehiclePositionsService {
             return List.of();
         }
 
-        try {
-            var feed = GtfsRealtime.FeedMessage.parseFrom(body);
-            List<VehiclePositionDTO> out = new ArrayList<>(Math.max(32, feed.getEntityCount()));
+        var feed = GtfsRealtime.FeedMessage.parseFrom(body);
+        List<VehiclePositionDTO> out = new ArrayList<>(Math.max(32, feed.getEntityCount()));
 
-            for (var ent : feed.getEntityList()) {
-                if (!ent.hasVehicle()) continue;
-                var v = ent.getVehicle();
+        for (var ent : feed.getEntityList()) {
+            if (!ent.hasVehicle()) continue;
+            var v = ent.getVehicle();
 
-                String routeId = v.hasTrip() ? v.getTrip().getRouteId() : null;
-                String tripId  = v.hasTrip() ? v.getTrip().getTripId()  : null;
-                String vehId   = v.hasVehicle() ? v.getVehicle().getId() : null;
+            String routeId = v.hasTrip() ? v.getTrip().getRouteId() : null;
+            String tripId  = v.hasTrip() ? v.getTrip().getTripId()  : null;
+            String vehId   = v.hasVehicle() ? v.getVehicle().getId() : null;
 
-                Double lat = (v.hasPosition() && v.getPosition().hasLatitude()) ? (double) v.getPosition().getLatitude() : null;
-                Double lon = (v.hasPosition() && v.getPosition().hasLongitude()) ? (double) v.getPosition().getLongitude() : null;
+            Double lat = (v.hasPosition() && v.getPosition().hasLatitude()) ? (double) v.getPosition().getLatitude() : null;
+            Double lon = (v.hasPosition() && v.getPosition().hasLongitude()) ? (double) v.getPosition().getLongitude() : null;
 
-                Double kmh = null;
-                if (v.hasPosition() && v.getPosition().hasSpeed()) {
-                    kmh = round3(v.getPosition().getSpeed());
-                }
-
-                String ts = null;
-                if (v.hasTimestamp()) {
-                    ts = ISO_ROME.format(Instant.ofEpochSecond(v.getTimestamp()));
-                }
-
-                GtfsIndexService.Trip trip = indexService.tripByIdOrNull(tripId);
-                String capolinea = (trip != null) ? trip.headsign() : null;
-
-                out.add(VehiclePositionDTO.builder()
-                        .linea(routeId)
-                        .corsa(tripId)
-                        .veicolo(vehId)
-                        .lat(lat)
-                        .lon(lon)
-                        .velocitaKmh(kmh)
-                        .timestamp(ts)
-                        .capolinea(capolinea)
-                        .build());
+            Double kmh = null;
+            if (v.hasPosition() && v.getPosition().hasSpeed()) {
+                kmh = round3(v.getPosition().getSpeed());
             }
-            return out;
 
-        } catch (InvalidProtocolBufferException pe) {
-            log.error("[VehiclePositions] feed protobuf corrotto: {}", pe.toString());
-            return List.of();
-        } catch (Exception e) {
-            log.error("[VehiclePositions] parse error: {}", e.toString());
-            return List.of();
+            String ts = null;
+            if (v.hasTimestamp()) {
+                ts = ISO_ROME.format(Instant.ofEpochSecond(v.getTimestamp()));
+            }
+
+            GtfsIndexService.Trip trip = indexService.tripByIdOrNull(tripId);
+            String capolinea = (trip != null) ? trip.headsign() : null;
+            Boolean wheelchairAccessible = wheelchairAccessible(trip);
+            String occupancyStatus = v.hasOccupancyStatus() ? v.getOccupancyStatus().name() : null;
+
+            out.add(VehiclePositionDTO.builder()
+                    .linea(routeId)
+                    .corsa(tripId)
+                    .veicolo(vehId)
+                    .lat(lat)
+                    .lon(lon)
+                    .velocitaKmh(kmh)
+                    .timestamp(ts)
+                    .capolinea(capolinea)
+                    .occupancyStatus(occupancyStatus)
+                    .wheelchairAccessible(wheelchairAccessible)
+                    .build());
         }
+        return out;
+    }
+
+    private static Boolean wheelchairAccessible(GtfsIndexService.Trip trip) {
+        if (trip == null || trip.wheelchair() == null) return null;
+        if (trip.wheelchair() == 1) return Boolean.TRUE;
+        if (trip.wheelchair() == 2) return Boolean.FALSE;
+        return null;
     }
 
     private boolean isExpired(CacheEntry<?> entry) {

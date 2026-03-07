@@ -10,6 +10,8 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
 import java.time.Instant;
+import java.text.Normalizer;
+import java.util.Locale;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -19,20 +21,31 @@ import java.util.concurrent.ConcurrentHashMap;
 @RequiredArgsConstructor
 public class VehiclePositionsSseService {
     private final GtfsIndexService gtfsIndexService;
-    private final Set<SseEmitter> emitters = ConcurrentHashMap.newKeySet();
+    private final Set<Subscription> emitters = ConcurrentHashMap.newKeySet();
 
     public SseEmitter subscribe(List<VehiclePositionDTO> snapshot, Instant generatedAt) {
-        SseEmitter emitter = new SseEmitter(0L);
-        emitters.add(emitter);
+        return subscribe(snapshot, generatedAt, null, null, null);
+    }
 
-        emitter.onCompletion(() -> emitters.remove(emitter));
+    public SseEmitter subscribe(
+            List<VehiclePositionDTO> snapshot,
+            Instant generatedAt,
+            String linea,
+            String destination,
+            String vehicleId
+    ) {
+        SseEmitter emitter = new SseEmitter(0L);
+        Subscription subscription = new Subscription(emitter, linea, normalizeText(destination), vehicleId);
+        emitters.add(subscription);
+
+        emitter.onCompletion(() -> emitters.remove(subscription));
         emitter.onTimeout(() -> {
-            emitters.remove(emitter);
+            emitters.remove(subscription);
             emitter.complete();
         });
-        emitter.onError((ex) -> emitters.remove(emitter));
+        emitter.onError((ex) -> emitters.remove(subscription));
 
-        sendSnapshot(emitter, snapshot, generatedAt);
+        sendSnapshot(subscription, snapshot, generatedAt);
         return emitter;
     }
 
@@ -40,22 +53,22 @@ public class VehiclePositionsSseService {
         if (emitters.isEmpty()) {
             return;
         }
-        for (SseEmitter emitter : List.copyOf(emitters)) {
-            if (!sendSnapshot(emitter, snapshot, generatedAt)) {
-                emitters.remove(emitter);
+        for (Subscription subscription : List.copyOf(emitters)) {
+            if (!sendSnapshot(subscription, snapshot, generatedAt)) {
+                emitters.remove(subscription);
             }
         }
     }
 
-    private boolean sendSnapshot(SseEmitter emitter, List<VehiclePositionDTO> snapshot, Instant generatedAt) {
+    private boolean sendSnapshot(Subscription subscription, List<VehiclePositionDTO> snapshot, Instant generatedAt) {
         try {
-            emitter.send(SseEmitter.event()
+            subscription.emitter().send(SseEmitter.event()
                     .name("vehicles")
-                    .data(toApiResponse(snapshot, generatedAt)));
+                    .data(toApiResponse(filterSnapshot(snapshot, subscription), generatedAt)));
             return true;
         } catch (IOException e) {
             try {
-                emitter.completeWithError(e);
+                subscription.emitter().completeWithError(e);
             } catch (Exception ignored) {
                 // no-op
             }
@@ -78,7 +91,42 @@ public class VehiclePositionsSseService {
                 dto.getLat(),
                 dto.getLon(),
                 dto.getVelocitaKmh(),
-                dto.getTimestamp()
+                dto.getTimestamp(),
+                dto.getOccupancyStatus(),
+                dto.getWheelchairAccessible()
         );
     }
+
+    private List<VehiclePositionDTO> filterSnapshot(List<VehiclePositionDTO> snapshot, Subscription subscription) {
+        return snapshot.stream().filter(dto -> {
+            if (subscription.vehicleId() != null && !subscription.vehicleId().isBlank()) {
+                if (!subscription.vehicleId().equals(dto.getVeicolo())) return false;
+            }
+            if (subscription.linea() != null && !subscription.linea().isBlank()) {
+                if (!gtfsIndexService.matchesLine(subscription.linea(), dto.getLinea())) return false;
+            }
+            if (subscription.normalizedDestination() != null) {
+                if (!subscription.normalizedDestination().equals(normalizeText(dto.getCapolinea()))) return false;
+            }
+            return true;
+        }).toList();
+    }
+
+    private static String normalizeText(String value) {
+        if (value == null) return null;
+        String normalized = Normalizer.normalize(value, Normalizer.Form.NFD)
+                .replaceAll("\\p{M}+", "")
+                .toLowerCase(Locale.ROOT)
+                .replaceAll("[^\\p{Alnum}]+", " ")
+                .trim()
+                .replaceAll("\\s+", " ");
+        return normalized.isEmpty() ? null : normalized;
+    }
+
+    private record Subscription(
+            SseEmitter emitter,
+            String linea,
+            String normalizedDestination,
+            String vehicleId
+    ) {}
 }

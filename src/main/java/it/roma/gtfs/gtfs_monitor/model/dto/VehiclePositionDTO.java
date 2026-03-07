@@ -14,5 +14,6 @@ public class VehiclePositionDTO {
     Double velocitaKmh;  // position.speed (m/s) -> km/h
     String timestamp;    // ISO Europe/Rome
     String capolinea;    // trip_headsign da trips.txt
-
+    String occupancyStatus;
+    Boolean wheelchairAccessible;
 }
