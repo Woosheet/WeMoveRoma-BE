@@ -63,12 +63,16 @@ public class NearbyService {
             int arrivalsLimit,
             long now
     ) {
-        List<NearbyArrivalDTO> arrivals = updates.stream()
+        List<NearbyArrivalDTO> liveArrivals = updates.stream()
                 .map(u -> toArrival(u, vehiclesByTripId, vehiclesById, now))
                 .filter(Objects::nonNull)
-                .sorted(Comparator.comparingInt(NearbyArrivalDTO::etaMinutes))
-                .limit(arrivalsLimit)
                 .toList();
+        List<NearbyArrivalDTO> scheduledArrivals = gtfsIndexService
+                .scheduledArrivalsForStop(sd.stop.id(), Instant.ofEpochMilli(now), 180, arrivalsLimit * 3)
+                .stream()
+                .map(this::toScheduledArrival)
+                .toList();
+        List<NearbyArrivalDTO> arrivals = mergeArrivals(liveArrivals, scheduledArrivals, arrivalsLimit);
 
         return new NearbyStopDTO(
                 sd.stop.id(),
@@ -79,6 +83,47 @@ public class NearbyService {
                 Math.max(1, (int) Math.round(sd.distanceMeters / 80.0)),
                 arrivals
         );
+    }
+
+    private NearbyArrivalDTO toScheduledArrival(GtfsIndexService.ScheduledArrival arrival) {
+        return new NearbyArrivalDTO(
+                arrival.line(),
+                arrival.destination(),
+                arrival.tripId(),
+                arrival.stopId(),
+                null,
+                arrival.arrivalTime() != null ? arrival.arrivalTime().toString() : null,
+                arrival.departureTime() != null ? arrival.departureTime().toString() : null,
+                arrival.etaMinutes(),
+                Boolean.FALSE,
+                null,
+                arrival.wheelchairAccessible()
+        );
+    }
+
+    private List<NearbyArrivalDTO> mergeArrivals(
+            List<NearbyArrivalDTO> liveArrivals,
+            List<NearbyArrivalDTO> scheduledArrivals,
+            int arrivalsLimit
+    ) {
+        Set<String> liveTripIds = liveArrivals.stream()
+                .map(NearbyArrivalDTO::tripId)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+
+        List<NearbyArrivalDTO> merged = new ArrayList<>(liveArrivals.size() + scheduledArrivals.size());
+        merged.addAll(liveArrivals);
+        for (NearbyArrivalDTO scheduled : scheduledArrivals) {
+            if (scheduled.tripId() != null && liveTripIds.contains(scheduled.tripId())) {
+                continue;
+            }
+            merged.add(scheduled);
+        }
+
+        return merged.stream()
+                .sorted(Comparator.comparingInt(NearbyArrivalDTO::etaMinutes))
+                .limit(arrivalsLimit)
+                .toList();
     }
 
     private NearbyArrivalDTO toArrival(
