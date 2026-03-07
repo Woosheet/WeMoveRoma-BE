@@ -46,10 +46,6 @@ public class VehiclePositionsService {
 
     public List<VehiclePositionDTO> fetch(String linea, String capolinea, Integer limit) {
         List<VehiclePositionDTO> base = getCachedOrRefresh();
-        if (base.isEmpty()) {
-            return List.of();
-        }
-
         String normalizedCapolinea = normalizeText(capolinea);
         int max = normalizeLimit(limit);
         List<VehiclePositionDTO> out = new ArrayList<>(max > 0 ? Math.min(max, base.size()) : base.size());
@@ -65,7 +61,13 @@ public class VehiclePositionsService {
                 break;
             }
         }
-        return out;
+        if (!out.isEmpty()) {
+            return out;
+        }
+        if (linea == null || linea.isBlank()) {
+            return List.of();
+        }
+        return simulateVehicles(linea, capolinea, 1);
     }
 
     public Instant lastSnapshotAt() {
@@ -230,6 +232,66 @@ public class VehiclePositionsService {
         return normalized.isEmpty() ? null : normalized;
     }
 
+    private List<VehiclePositionDTO> simulateVehicles(String linea, String capolinea, int limit) {
+        long nowEpochSeconds = Instant.now().getEpochSecond();
+        String timestamp = ISO_ROME.format(Instant.ofEpochSecond(nowEpochSeconds));
+        List<VehiclePositionDTO> out = new ArrayList<>();
+        Instant now = Instant.ofEpochSecond(nowEpochSeconds);
+        List<GtfsIndexService.SimulatedTrip> simulatedTrips = indexService.simulatedTrips(linea, capolinea, now, limit);
+        if (simulatedTrips.isEmpty() && capolinea != null && !capolinea.isBlank()) {
+            simulatedTrips = indexService.simulatedTrips(linea, null, now, limit);
+        }
+
+        for (GtfsIndexService.SimulatedTrip simulated : simulatedTrips) {
+            double progress = tripProgress(nowEpochSeconds, simulated.startEpochSeconds(), simulated.endEpochSeconds());
+            Position pos = interpolateOnShape(simulated.shape(), progress);
+            if (pos == null) continue;
+
+            out.add(VehiclePositionDTO.builder()
+                    .linea(simulated.line())
+                    .corsa(simulated.tripId())
+                    .veicolo("sim-" + simulated.tripId())
+                    .lat(pos.lat())
+                    .lon(pos.lon())
+                    .velocitaKmh(null)
+                    .timestamp(timestamp)
+                    .capolinea(simulated.destination())
+                    .occupancyStatus(null)
+                    .wheelchairAccessible(simulated.wheelchairAccessible())
+                    .build());
+        }
+        return List.copyOf(out);
+    }
+
+    private static double tripProgress(long nowEpochSeconds, long startEpochSeconds, long endEpochSeconds) {
+        if (endEpochSeconds <= startEpochSeconds) return 0d;
+        double raw = (double) (nowEpochSeconds - startEpochSeconds) / (double) (endEpochSeconds - startEpochSeconds);
+        return Math.max(0d, Math.min(1d, raw));
+    }
+
+    private static Position interpolateOnShape(List<GtfsIndexService.ShapePoint> shape, double progress) {
+        if (shape == null || shape.isEmpty()) return null;
+        if (shape.size() == 1) {
+            GtfsIndexService.ShapePoint point = shape.get(0);
+            return new Position(point.lat(), point.lon());
+        }
+
+        double scaled = progress * (shape.size() - 1);
+        int lowerIndex = (int) Math.floor(scaled);
+        int upperIndex = Math.min(shape.size() - 1, lowerIndex + 1);
+        double fraction = scaled - lowerIndex;
+
+        GtfsIndexService.ShapePoint a = shape.get(lowerIndex);
+        GtfsIndexService.ShapePoint b = shape.get(upperIndex);
+        if (a.lat() == null || a.lon() == null || b.lat() == null || b.lon() == null) {
+            return null;
+        }
+
+        double lat = a.lat() + (b.lat() - a.lat()) * fraction;
+        double lon = a.lon() + (b.lon() - a.lon()) * fraction;
+        return new Position(lat, lon);
+    }
+
     private record CacheEntry<T>(T data, long loadedAtMillis) {
         private static <T> CacheEntry<T> empty() {
             return new CacheEntry<>(null, 0L);
@@ -239,4 +301,6 @@ public class VehiclePositionsService {
             return data == null;
         }
     }
+
+    private record Position(double lat, double lon) {}
 }

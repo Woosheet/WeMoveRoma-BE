@@ -92,9 +92,17 @@ public class ApiVehiclesController {
             @RequestParam(required = false) Integer limit
     ) {
         log.debug("GET /api/v1/vehicles/{}/next-stops limit={}", vehicleId, limit);
-        List<ApiVehicleNextStopDTO> items = tripUpdatesService.nextStopsByVehicle(vehicleId, limit).stream()
-                .map(this::toNextStopDto)
-                .toList();
+        List<ApiVehicleNextStopDTO> items;
+        if (vehicleId != null && vehicleId.startsWith("sim-")) {
+            String tripId = vehicleId.substring(4);
+            items = gtfsIndexService.scheduledNextStopsForTrip(tripId, Instant.now(), normalizeLimit(limit)).stream()
+                    .map(this::toScheduledNextStopDto)
+                    .toList();
+        } else {
+            items = tripUpdatesService.nextStopsByVehicle(vehicleId, limit).stream()
+                    .map(this::toNextStopDto)
+                    .toList();
+        }
         return new ApiVehicleNextStopsResponseDTO(vehicleId, items, items.size(), Instant.now());
     }
 
@@ -112,6 +120,26 @@ public class ApiVehiclesController {
                 dto.getRitardoArrivoMin(),
                 dto.getRitardoPartenzaMin()
         );
+    }
+
+    private ApiVehicleNextStopDTO toScheduledNextStopDto(GtfsIndexService.ScheduledTripStop stop) {
+        return new ApiVehicleNextStopDTO(
+                stop.stopId(),
+                stop.stopName(),
+                stop.tripId(),
+                stop.line(),
+                stop.lat(),
+                stop.lon(),
+                stop.arrivalTime() != null ? stop.arrivalTime().toString() : null,
+                stop.departureTime() != null ? stop.departureTime().toString() : null,
+                null,
+                null
+        );
+    }
+
+    private static int normalizeLimit(Integer limit) {
+        if (limit == null || limit <= 0) return 20;
+        return Math.min(limit, 100);
     }
 
     private static String toIso(String value) {
