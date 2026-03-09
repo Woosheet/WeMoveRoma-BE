@@ -1,5 +1,6 @@
 package it.roma.gtfs.gtfs_monitor.service;
 
+import it.roma.gtfs.gtfs_monitor.model.dto.ApiStopSearchItemDTO;
 import it.roma.gtfs.gtfs_monitor.model.dto.NearbyArrivalDTO;
 import it.roma.gtfs.gtfs_monitor.model.dto.NearbyResponseDTO;
 import it.roma.gtfs.gtfs_monitor.model.dto.NearbyStopDTO;
@@ -8,6 +9,7 @@ import it.roma.gtfs.gtfs_monitor.model.dto.VehiclePositionDTO;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
+import java.text.Normalizer;
 import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -22,6 +24,85 @@ public class NearbyService {
     private final GtfsIndexService gtfsIndexService;
     private final TripUpdatesService tripUpdatesService;
     private final VehiclePositionsService vehiclePositionsService;
+
+    public List<ApiStopSearchItemDTO> searchStops(String query, Integer limit) {
+        String normalizedQuery = normalizeText(query);
+        if (normalizedQuery == null) {
+            return List.of();
+        }
+        int max = limit == null || limit <= 0 ? 20 : Math.min(limit, 50);
+
+        return gtfsIndexService.allStops().stream()
+                .map(stop -> new ScoredStop(stop, stopScore(stop, normalizedQuery)))
+                .filter(scored -> scored.score() > 0)
+                .sorted(Comparator
+                        .comparingInt(ScoredStop::score).reversed()
+                        .thenComparing(scored -> scored.stop().name(), String.CASE_INSENSITIVE_ORDER))
+                .limit(max)
+                .map(scored -> new ApiStopSearchItemDTO(
+                        scored.stop().id(),
+                        scored.stop().code(),
+                        scored.stop().name(),
+                        scored.stop().lat() != null ? scored.stop().lat().doubleValue() : null,
+                        scored.stop().lon() != null ? scored.stop().lon().doubleValue() : null
+                ))
+                .toList();
+    }
+
+    public List<ApiStopSearchItemDTO> listStops(
+            Double minLat,
+            Double maxLat,
+            Double minLon,
+            Double maxLon,
+            Integer limit
+    ) {
+        int max = limit == null || limit <= 0 ? 10000 : Math.min(limit, 10000);
+        boolean bounded = minLat != null && maxLat != null && minLon != null && maxLon != null;
+        return gtfsIndexService.allStops().stream()
+                .filter(stop -> stop.lat() != null && stop.lon() != null)
+                .filter(stop -> !bounded || (
+                        stop.lat() >= minLat && stop.lat() <= maxLat &&
+                        stop.lon() >= minLon && stop.lon() <= maxLon
+                ))
+                .sorted(Comparator.comparing(GtfsIndexService.Stop::name, String.CASE_INSENSITIVE_ORDER))
+                .limit(max)
+                .map(stop -> new ApiStopSearchItemDTO(
+                        stop.id(),
+                        stop.code(),
+                        stop.name(),
+                        stop.lat() != null ? stop.lat().doubleValue() : null,
+                        stop.lon() != null ? stop.lon().doubleValue() : null
+                ))
+                .toList();
+    }
+
+    public NearbyStopDTO stopArrivals(String stopId, Integer limitArrivalsPerStop) {
+        if (stopId == null || stopId.isBlank()) {
+            return new NearbyStopDTO(stopId, "Fermata non trovata", null, null, null, null, List.of());
+        }
+        GtfsIndexService.Stop stop = gtfsIndexService.stopByIdOrNull(stopId);
+        if (stop == null) {
+            return new NearbyStopDTO(stopId, "Fermata non trovata", null, null, null, null, List.of());
+        }
+
+        int arrivalsLimit = limitArrivalsPerStop == null || limitArrivalsPerStop <= 0 ? 8 : Math.min(limitArrivalsPerStop, 12);
+        long now = System.currentTimeMillis();
+        List<TripUpdateDTO> updates = tripUpdatesService.fetch(null, null);
+        List<VehiclePositionDTO> vehicles = vehiclePositionsService.fetch(null, null, null);
+
+        List<TripUpdateDTO> updatesForStop = updates.stream()
+                .filter(u -> stopId.equals(u.getFermataId()))
+                .toList();
+
+        Map<String, VehiclePositionDTO> vehiclesByTripId = vehicles.stream()
+                .filter(v -> v.getCorsa() != null && !v.getCorsa().isBlank())
+                .collect(Collectors.toMap(VehiclePositionDTO::getCorsa, v -> v, (a, b) -> a));
+        Map<String, VehiclePositionDTO> vehiclesById = vehicles.stream()
+                .filter(v -> v.getVeicolo() != null && !v.getVeicolo().isBlank())
+                .collect(Collectors.toMap(VehiclePositionDTO::getVeicolo, v -> v, (a, b) -> a));
+
+        return toNearbyStop(new StopDistance(stop, 0), updatesForStop, vehiclesByTripId, vehiclesById, arrivalsLimit, now, false);
+    }
 
     public NearbyResponseDTO nearby(double lat, double lon, Integer radiusMeters, Integer limitStops, Integer limitArrivalsPerStop) {
         int radius = radiusMeters == null || radiusMeters <= 0 ? 500 : Math.min(radiusMeters, 3000);
@@ -49,7 +130,7 @@ public class NearbyService {
                 .filter(sd -> sd.distanceMeters <= radius)
                 .sorted(Comparator.comparingInt(sd -> sd.distanceMeters))
                 .limit(stopsLimit)
-                .map(sd -> toNearbyStop(sd, updatesByStop.getOrDefault(sd.stop.id(), List.of()), vehiclesByTripId, vehiclesById, arrivalsLimit, now))
+                .map(sd -> toNearbyStop(sd, updatesByStop.getOrDefault(sd.stop.id(), List.of()), vehiclesByTripId, vehiclesById, arrivalsLimit, now, true))
                 .toList();
 
         return new NearbyResponseDTO(lat, lon, radius, stops, Instant.now());
@@ -61,7 +142,8 @@ public class NearbyService {
             Map<String, VehiclePositionDTO> vehiclesByTripId,
             Map<String, VehiclePositionDTO> vehiclesById,
             int arrivalsLimit,
-            long now
+            long now,
+            boolean includeDistance
     ) {
         List<NearbyArrivalDTO> liveArrivals = updates.stream()
                 .map(u -> toArrival(u, vehiclesByTripId, vehiclesById, now))
@@ -79,10 +161,38 @@ public class NearbyService {
                 sd.stop.name(),
                 sd.stop.lat() != null ? sd.stop.lat().doubleValue() : null,
                 sd.stop.lon() != null ? sd.stop.lon().doubleValue() : null,
-                sd.distanceMeters,
-                Math.max(1, (int) Math.round(sd.distanceMeters / 80.0)),
+                includeDistance ? sd.distanceMeters : null,
+                includeDistance ? Math.max(1, (int) Math.round(sd.distanceMeters / 80.0)) : null,
                 arrivals
         );
+    }
+
+    private static int stopScore(GtfsIndexService.Stop stop, String normalizedQuery) {
+        String id = normalizeText(stop.id());
+        String code = normalizeText(stop.code());
+        String name = normalizeText(stop.name());
+        String desc = normalizeText(stop.desc());
+
+        if (normalizedQuery.equals(id) || normalizedQuery.equals(code)) return 120;
+        if (name != null && name.equals(normalizedQuery)) return 110;
+        if (code != null && code.startsWith(normalizedQuery)) return 100;
+        if (id != null && id.startsWith(normalizedQuery)) return 95;
+        if (name != null && name.startsWith(normalizedQuery)) return 90;
+        if (desc != null && desc.startsWith(normalizedQuery)) return 75;
+        if (name != null && name.contains(normalizedQuery)) return 60;
+        if (desc != null && desc.contains(normalizedQuery)) return 45;
+        return 0;
+    }
+
+    private static String normalizeText(String value) {
+        if (value == null) return null;
+        String normalized = Normalizer.normalize(value, Normalizer.Form.NFD)
+                .replaceAll("\\p{M}+", "")
+                .toLowerCase(Locale.ROOT)
+                .replaceAll("[^\\p{Alnum}]+", " ")
+                .trim()
+                .replaceAll("\\s+", " ");
+        return normalized.isEmpty() ? null : normalized;
     }
 
     private NearbyArrivalDTO toScheduledArrival(GtfsIndexService.ScheduledArrival arrival) {
@@ -223,4 +333,5 @@ public class NearbyService {
     }
 
     private record StopDistance(GtfsIndexService.Stop stop, int distanceMeters) {}
+    private record ScoredStop(GtfsIndexService.Stop stop, int score) {}
 }
