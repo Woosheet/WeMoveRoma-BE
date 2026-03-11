@@ -13,7 +13,7 @@ services:
       - ./logs:/app/logs
 
     environment:
-      SPRING_PROFILES_ACTIVE: "default"
+      SPRING_PROFILES_ACTIVE: "prod"
 
       LOGGING_FILE_NAME: "/app/logs/app.log"
 
@@ -24,6 +24,7 @@ services:
       GTFS_REALTIME_TRIPUPDATESURL: "https://romamobilita.it/sites/default/files/rome_rtgtfs_trip_updates_feed.pb"
       GTFS_REALTIME_VEHICLEPOSITIONSURL: "https://romamobilita.it/sites/default/files/rome_rtgtfs_vehicle_positions_feed.pb"
       GTFS_REALTIME_SERVICEALERTSURL: "https://romamobilita.it/sites/default/files/rome_rtgtfs_service_alerts_feed.pb"
+      JOURNEY_OTP_BASE_URL: "http://host.docker.internal:8081"
 
       JAVA_OPTS: "-Xms512m -Xmx1g"
 
