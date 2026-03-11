@@ -6,6 +6,7 @@ public record JourneyLegDTO(
         String mode,
         String line,
         String routeShortName,
+        Boolean realtime,
         String headsign,
         String fromName,
         String toName,

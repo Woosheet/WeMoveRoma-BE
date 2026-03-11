@@ -39,11 +39,13 @@ public class ApiPlannerController {
             @RequestParam String linea,
             @RequestParam String stopName,
             @RequestParam(required = false) String headsign,
+            @RequestParam(required = false) String tripId,
             @RequestParam(required = false) Double stopLat,
             @RequestParam(required = false) Double stopLon
     ) {
         String line = trimToNull(linea);
         String stop = trimToNull(stopName);
+        String selectedTripId = trimToNull(tripId);
         if (line == null || stop == null) {
             return new ApiPlannerLiveStopFocusDTO(null, "ETA non disponibile", null, null, "invalid", false, null, null);
         }
@@ -58,6 +60,7 @@ public class ApiPlannerController {
         List<Candidate> candidates = new ArrayList<>();
         for (TripUpdateDTO update : updates) {
             if (!gtfsIndexService.matchesLine(line, update.getLinea())) continue;
+            if (selectedTripId != null && !Objects.equals(selectedTripId, trimToNull(update.getCorsa()))) continue;
             if (trimToNull(update.getFermataNome()) == null) continue;
             if (!isLikelySameStopName(normalizedStop, normalize(update.getFermataNome()))) continue;
 
@@ -80,6 +83,7 @@ public class ApiPlannerController {
         Candidate best = candidates.isEmpty() ? null : candidates.get(0);
         if (best == null) {
             VehiclePositionDTO fallback = vehicles.stream()
+                    .filter(v -> selectedTripId == null || Objects.equals(v.getCorsa(), selectedTripId))
                     .sorted(
                             Comparator.<VehiclePositionDTO>comparingInt(v -> directionPenalty(normalizedHeadsign, v.getCapolinea()))
                                     .thenComparingDouble(v -> stopDistancePenalty(stopLat, stopLon, v))

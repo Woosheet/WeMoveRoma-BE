@@ -18,20 +18,24 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class JourneyPlannerService {
+    private static final int MAX_OTP_OPTIONS = 12;
     private static final String OTP_GTFS_GRAPHQL_QUERY_TEMPLATE = """
             {
               planConnection(
                 origin: { label: "%s", location: { coordinate: { latitude: %s, longitude: %s } } }
                 destination: { label: "%s", location: { coordinate: { latitude: %s, longitude: %s } } }
-                dateTime: { earliestDeparture: "%s" }
+                dateTime: { %s: "%s" }
                 searchWindow: "PT60M"
                 first: %d
               ) {
@@ -83,11 +87,14 @@ public class JourneyPlannerService {
             double toLat,
             double toLon,
             String toLabel,
-            Integer numItineraries
+            Integer numItineraries,
+            String timeMode,
+            String when
     ) {
         JourneyLocationDTO from = new JourneyLocationDTO(fromLat, fromLon, fromLabel);
         JourneyLocationDTO to = new JourneyLocationDTO(toLat, toLon, toLabel);
         int limit = numItineraries == null || numItineraries <= 0 ? 3 : Math.min(numItineraries, 6);
+        int upstreamLimit = Math.min(Math.max(limit * 3, limit + 2), MAX_OTP_OPTIONS);
 
         if (!otpEnabled) {
             return new JourneyPlanResponseDTO(
@@ -103,7 +110,7 @@ public class JourneyPlannerService {
         try {
             URI uri = resolveOtpGraphQlUri();
             Instant now = Instant.now();
-            OffsetDateTime odt = OffsetDateTime.now();
+            TimePreference preference = resolveTimePreference(timeMode, when, now);
             String query = OTP_GTFS_GRAPHQL_QUERY_TEMPLATE.formatted(
                     escapeGraphqlString(firstNonBlank(fromLabel, "Partenza")),
                     trimDecimals(fromLat),
@@ -111,8 +118,9 @@ public class JourneyPlannerService {
                     escapeGraphqlString(firstNonBlank(toLabel, "Destinazione")),
                     trimDecimals(toLat),
                     trimDecimals(toLon),
-                    odt.toInstant().toString(),
-                    limit
+                    preference.graphQlField(),
+                    preference.when().toString(),
+                    upstreamLimit
             );
 
             Map<String, Object> request = new LinkedHashMap<>();
@@ -142,13 +150,13 @@ public class JourneyPlannerService {
             List<Map<String, Object>> edges = planConnection.get("edges") instanceof List<?> l
                     ? (List<Map<String, Object>>) (List<?>) l : List.of();
 
-            List<JourneyOptionDTO> options = edges.stream()
+            List<JourneyOptionDTO> rawOptions = edges.stream()
                     .map(edge -> edge.get("node"))
                     .filter(Map.class::isInstance)
                     .map(node -> toJourneyOption((Map<String, Object>) node))
                     .filter(o -> o.legs() != null && !o.legs().isEmpty())
-                    .limit(limit)
                     .toList();
+            List<JourneyOptionDTO> options = dedupeJourneyOptions(rawOptions, limit);
 
             String error = options.isEmpty() ? "Nessun percorso trovato." : null;
             return new JourneyPlanResponseDTO("otp", from, to, options, error, now);
@@ -200,6 +208,7 @@ public class JourneyPlannerService {
                 );
             }
             String headsign = toStringOrNull(leg.get("headsign"));
+            Boolean realtime = leg.get("realTime") instanceof Boolean b ? b : null;
             String fromName = null;
             Double fromLat = null;
             Double fromLon = null;
@@ -238,6 +247,7 @@ public class JourneyPlannerService {
                     normalizeMode(mode),
                     lineCode,
                     lineCode,
+                    realtime,
                     headsign,
                     fromName,
                     toName,
@@ -341,6 +351,111 @@ public class JourneyPlannerService {
         }
     }
 
+    private static List<JourneyOptionDTO> dedupeJourneyOptions(List<JourneyOptionDTO> rawOptions, int limit) {
+        if (rawOptions.isEmpty()) {
+            return List.of();
+        }
+        List<JourneyOptionDTO> ordered = rawOptions.stream()
+                .sorted(Comparator
+                        .comparing((JourneyOptionDTO option) -> isWalkOnly(option))
+                        .thenComparingInt(JourneyPlannerService::journeyBusPriorityScore)
+                        .thenComparingInt(option -> option.durationMinutes() != null ? option.durationMinutes() : Integer.MAX_VALUE)
+                        .thenComparingInt(option -> option.walkMinutes() != null ? option.walkMinutes() : Integer.MAX_VALUE)
+                        .thenComparingInt(option -> option.transfers() != null ? option.transfers() : Integer.MAX_VALUE))
+                .toList();
+
+        Set<String> seen = new LinkedHashSet<>();
+        List<JourneyOptionDTO> unique = new ArrayList<>();
+        for (JourneyOptionDTO option : ordered) {
+            if (!seen.add(journeyOptionSignature(option))) {
+                continue;
+            }
+            unique.add(option);
+            if (unique.size() >= limit) {
+                break;
+            }
+        }
+        return unique;
+    }
+
+    private static String journeyOptionSignature(JourneyOptionDTO option) {
+        StringBuilder out = new StringBuilder();
+        out.append(option.transfers() != null ? option.transfers() : -1)
+                .append('|')
+                .append(option.walkMinutes() != null ? option.walkMinutes() : -1)
+                .append('|')
+                .append(bucketTime(option.startTime()))
+                .append('|')
+                .append(bucketTime(option.endTime()));
+
+        for (JourneyLegDTO leg : option.legs()) {
+            String mode = firstNonBlank(leg.mode(), "NA");
+            out.append("||").append(mode);
+            if ("WALK".equalsIgnoreCase(mode)) {
+                out.append('|')
+                        .append(normalizeKey(leg.fromName()))
+                        .append('|')
+                        .append(normalizeKey(leg.toName()));
+                continue;
+            }
+            out.append('|')
+                    .append(normalizeKey(firstNonBlank(leg.routeShortName(), leg.line())))
+                    .append('|')
+                    .append(normalizeKey(leg.headsign()))
+                    .append('|')
+                    .append(normalizeKey(leg.fromName()))
+                    .append('|')
+                    .append(normalizeKey(leg.toName()))
+                    .append('|')
+                    .append(bucketTime(leg.startTime()))
+                    .append('|')
+                    .append(bucketTime(leg.endTime()));
+        }
+        return out.toString();
+    }
+
+    private static int bucketTime(String iso) {
+        if (iso == null || iso.isBlank()) return -1;
+        try {
+            long minutes = Instant.parse(iso).getEpochSecond() / 60L;
+            return (int) (minutes / 5L);
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    private static String normalizeKey(String value) {
+        return value == null ? "" : value.trim().toLowerCase();
+    }
+
+    private static boolean isWalkOnly(JourneyOptionDTO option) {
+        return option.legs() != null
+                && !option.legs().isEmpty()
+                && option.legs().stream().allMatch(leg -> "WALK".equalsIgnoreCase(leg.mode()));
+    }
+
+    private static int journeyBusPriorityScore(JourneyOptionDTO option) {
+        if (option.legs() == null || option.legs().isEmpty()) {
+            return 100;
+        }
+        List<String> modes = option.legs().stream()
+                .map(JourneyLegDTO::mode)
+                .filter(mode -> mode != null && !mode.isBlank() && !"WALK".equalsIgnoreCase(mode))
+                .map(String::toUpperCase)
+                .toList();
+        if (modes.isEmpty()) {
+            return 100;
+        }
+
+        boolean hasBus = modes.contains("BUS");
+        boolean hasRail = modes.contains("SUBWAY") || modes.contains("RAIL") || modes.contains("TRAM");
+        int score = 0;
+        if (!hasBus) score += 40;
+        if (hasRail) score += 8;
+        score += (int) modes.stream().filter(mode -> !"BUS".equals(mode)).count() * 2;
+        return score;
+    }
+
     private static String extractGraphqlErrors(List<?> errors) {
         StringBuilder sb = new StringBuilder();
         for (Object err : errors) {
@@ -389,5 +504,33 @@ public class JourneyPlannerService {
                 .replace("\"", "\\\"")
                 .replace("\n", " ")
                 .replace("\r", " ");
+    }
+
+    private static TimePreference resolveTimePreference(String mode, String when, Instant now) {
+        Instant target = parseInstantOrNull(when);
+        String normalized = mode == null ? "" : mode.trim().toLowerCase();
+        if ("arrive-by".equals(normalized) && target != null) {
+            return new TimePreference("latestArrival", target);
+        }
+        if ("depart-at".equals(normalized) && target != null) {
+            return new TimePreference("earliestDeparture", target);
+        }
+        return new TimePreference("earliestDeparture", target != null ? target : now);
+    }
+
+    private static Instant parseInstantOrNull(String value) {
+        if (value == null || value.isBlank()) return null;
+        try {
+            return Instant.parse(value);
+        } catch (Exception ignored) {
+            try {
+                return OffsetDateTime.parse(value).toInstant();
+            } catch (Exception ignoredAgain) {
+                return null;
+            }
+        }
+    }
+
+    private record TimePreference(String graphQlField, Instant when) {
     }
 }

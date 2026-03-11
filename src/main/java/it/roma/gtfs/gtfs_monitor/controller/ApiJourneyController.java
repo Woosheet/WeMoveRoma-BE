@@ -24,9 +24,11 @@ public class ApiJourneyController {
             @RequestParam double toLon,
             @RequestParam(required = false) String fromLabel,
             @RequestParam(required = false) String toLabel,
-            @RequestParam(required = false) Integer numItineraries
+            @RequestParam(required = false) Integer numItineraries,
+            @RequestParam(required = false) String timeMode,
+            @RequestParam(required = false) String when
     ) {
         log.debug("GET /api/v1/journey/plan from={},{} to={},{}", fromLat, fromLon, toLat, toLon);
-        return journeyPlannerService.plan(fromLat, fromLon, fromLabel, toLat, toLon, toLabel, numItineraries);
+        return journeyPlannerService.plan(fromLat, fromLon, fromLabel, toLat, toLon, toLabel, numItineraries, timeMode, when);
     }
 }
