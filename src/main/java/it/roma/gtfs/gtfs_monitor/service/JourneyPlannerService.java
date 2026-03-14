@@ -51,7 +51,16 @@ public class JourneyPlannerService {
                       headsign
                       from { name lat lon }
                       to { name lat lon }
-                      route { shortName }
+                      route {
+                        gtfsId
+                        shortName
+                        longName
+                        agency { gtfsId name }
+                      }
+                      trip {
+                        gtfsId
+                        tripShortName
+                      }
                       legGeometry { points }
                       stopCalls {
                         stopLocation {
@@ -93,7 +102,7 @@ public class JourneyPlannerService {
     ) {
         JourneyLocationDTO from = new JourneyLocationDTO(fromLat, fromLon, fromLabel);
         JourneyLocationDTO to = new JourneyLocationDTO(toLat, toLon, toLabel);
-        int limit = numItineraries == null || numItineraries <= 0 ? 3 : Math.min(numItineraries, 6);
+        int limit = numItineraries == null || numItineraries <= 0 ? 5 : Math.min(numItineraries, 6);
         int upstreamLimit = Math.min(Math.max(limit * 3, limit + 2), MAX_OTP_OPTIONS);
 
         if (!otpEnabled) {
@@ -201,10 +210,36 @@ public class JourneyPlannerService {
             if (!walk) transitLegs++;
 
             String lineCode = null;
+            String routeLongName = null;
+            String agencyName = null;
+            String agencyId = null;
             if (leg.get("route") instanceof Map<?, ?> route) {
                 lineCode = firstNonBlank(
                         toStringOrNull(route.get("shortName")),
                         toStringOrNull(route.get("short_name"))
+                );
+                routeLongName = firstNonBlank(
+                        toStringOrNull(route.get("longName")),
+                        toStringOrNull(route.get("long_name"))
+                );
+                if (route.get("agency") instanceof Map<?, ?> agency) {
+                    agencyName = toStringOrNull(agency.get("name"));
+                    agencyId = firstNonBlank(
+                            toStringOrNull(agency.get("gtfsId")),
+                            toStringOrNull(agency.get("id"))
+                    );
+                }
+            }
+            String tripShortName = null;
+            String tripId = null;
+            if (leg.get("trip") instanceof Map<?, ?> trip) {
+                tripShortName = firstNonBlank(
+                        toStringOrNull(trip.get("tripShortName")),
+                        toStringOrNull(trip.get("shortName"))
+                );
+                tripId = firstNonBlank(
+                        toStringOrNull(trip.get("gtfsId")),
+                        toStringOrNull(trip.get("id"))
                 );
             }
             String headsign = toStringOrNull(leg.get("headsign"));
@@ -247,6 +282,11 @@ public class JourneyPlannerService {
                     normalizeMode(mode),
                     lineCode,
                     lineCode,
+                    routeLongName,
+                    agencyName,
+                    agencyId,
+                    tripShortName,
+                    tripId,
                     realtime,
                     headsign,
                     fromName,
@@ -358,10 +398,10 @@ public class JourneyPlannerService {
         List<JourneyOptionDTO> ordered = rawOptions.stream()
                 .sorted(Comparator
                         .comparing((JourneyOptionDTO option) -> isWalkOnly(option))
-                        .thenComparingInt(JourneyPlannerService::journeyBusPriorityScore)
                         .thenComparingInt(option -> option.durationMinutes() != null ? option.durationMinutes() : Integer.MAX_VALUE)
+                        .thenComparingInt(option -> option.transfers() != null ? option.transfers() : Integer.MAX_VALUE)
                         .thenComparingInt(option -> option.walkMinutes() != null ? option.walkMinutes() : Integer.MAX_VALUE)
-                        .thenComparingInt(option -> option.transfers() != null ? option.transfers() : Integer.MAX_VALUE))
+                        .thenComparingInt(JourneyPlannerService::journeyTransitPreferenceScore))
                 .toList();
 
         Set<String> seen = new LinkedHashSet<>();
@@ -434,7 +474,7 @@ public class JourneyPlannerService {
                 && option.legs().stream().allMatch(leg -> "WALK".equalsIgnoreCase(leg.mode()));
     }
 
-    private static int journeyBusPriorityScore(JourneyOptionDTO option) {
+    private static int journeyTransitPreferenceScore(JourneyOptionDTO option) {
         if (option.legs() == null || option.legs().isEmpty()) {
             return 100;
         }
@@ -447,12 +487,12 @@ public class JourneyPlannerService {
             return 100;
         }
 
-        boolean hasBus = modes.contains("BUS");
         boolean hasRail = modes.contains("SUBWAY") || modes.contains("RAIL") || modes.contains("TRAM");
+        boolean hasBus = modes.contains("BUS");
         int score = 0;
-        if (!hasBus) score += 40;
-        if (hasRail) score += 8;
-        score += (int) modes.stream().filter(mode -> !"BUS".equals(mode)).count() * 2;
+        if (hasRail) score -= 2;
+        if (!hasBus && !hasRail) score += 4;
+        score += Math.max(0, modes.size() - 1);
         return score;
     }
 

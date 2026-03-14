@@ -97,7 +97,16 @@ public class GtfsIndexService {
 
     public Trip tripByIdOrNull(String id) {
         if (id == null) return null;
-        return ref.get().trips().get(id);
+        Map<String, Trip> trips = ref.get().trips();
+        Trip direct = trips.get(id);
+        if (direct != null) {
+            return direct;
+        }
+        String normalized = stripFeedPrefix(id);
+        if (normalized == null || normalized.equals(id)) {
+            return null;
+        }
+        return trips.get(normalized);
     }
 
     public Set<String> tripsByRoute(String routeId) {
@@ -208,20 +217,24 @@ public class GtfsIndexService {
         if (tripId == null || tripId.isBlank()) {
             return Optional.empty();
         }
+        String resolvedTripId = resolveKnownTripId(tripId);
+        if (resolvedTripId == null) {
+            return Optional.empty();
+        }
         ZonedDateTime nowRome = ZonedDateTime.ofInstant(now, ROME_ZONE);
         long nowEpochSeconds = now.getEpochSecond();
 
-        Optional<SimulatedTrip> today = simulatedTripByIdOnDate(tripId, nowRome.toLocalDate(), nowEpochSeconds);
+        Optional<SimulatedTrip> today = simulatedTripByIdOnDate(resolvedTripId, nowRome.toLocalDate(), nowEpochSeconds);
         if (today.isPresent()) {
             return today;
         }
 
-        Optional<SimulatedTrip> yesterday = simulatedTripByIdOnDate(tripId, nowRome.toLocalDate().minusDays(1), nowEpochSeconds);
+        Optional<SimulatedTrip> yesterday = simulatedTripByIdOnDate(resolvedTripId, nowRome.toLocalDate().minusDays(1), nowEpochSeconds);
         if (yesterday.isPresent()) {
             return yesterday;
         }
 
-        return simulatedTripByIdOnDate(tripId, nowRome.toLocalDate().plusDays(1), nowEpochSeconds);
+        return simulatedTripByIdOnDate(resolvedTripId, nowRome.toLocalDate().plusDays(1), nowEpochSeconds);
     }
 
     public List<ScheduledTripStop> scheduledNextStopsForTrip(String tripId, Instant now, int limit) {
@@ -239,6 +252,49 @@ public class GtfsIndexService {
           return today;
         }
         return scheduledNextStopsForTripOnDate(trip, nowRome.toLocalDate().plusDays(1), now.getEpochSecond(), limit);
+    }
+
+    public List<ScheduledTripStop> scheduledStopsForTrip(String tripId, Instant when) {
+        if (tripId == null || tripId.isBlank()) {
+            return List.of();
+        }
+        Trip trip = tripByIdOrNull(tripId);
+        if (trip == null || trip.serviceId() == null || trip.serviceId().isBlank()) {
+            return List.of();
+        }
+
+        Instant reference = when != null ? when : Instant.now();
+        ZonedDateTime whenRome = ZonedDateTime.ofInstant(reference, ROME_ZONE);
+        List<ScheduledTripStop> currentDate = scheduledStopsForTripOnDate(trip, whenRome.toLocalDate());
+        if (!currentDate.isEmpty()) {
+            return currentDate;
+        }
+        return scheduledStopsForTripOnDate(trip, whenRome.toLocalDate().plusDays(1));
+    }
+
+    private String resolveKnownTripId(String tripId) {
+        if (tripId == null || tripId.isBlank()) {
+            return null;
+        }
+        if (ref.get().trips().containsKey(tripId)) {
+            return tripId;
+        }
+        String normalized = stripFeedPrefix(tripId);
+        if (normalized != null && ref.get().trips().containsKey(normalized)) {
+            return normalized;
+        }
+        return null;
+    }
+
+    private static String stripFeedPrefix(String value) {
+        if (value == null) {
+            return null;
+        }
+        int separator = value.indexOf(':');
+        if (separator <= 0 || separator >= value.length() - 1) {
+            return value;
+        }
+        return value.substring(separator + 1);
     }
 
     private static CsvParser newParser() {
@@ -775,6 +831,51 @@ public class GtfsIndexService {
             parser.stopParsing();
         } catch (IOException e) {
             log.error("[GTFS-Index] Errore leggendo stop_times per trip {}: {}", trip.tripId(), e.toString());
+            return List.of();
+        }
+
+        return List.copyOf(out);
+    }
+
+    private List<ScheduledTripStop> scheduledStopsForTripOnDate(Trip trip, LocalDate serviceDate) {
+        Indexes indexes = ref.get();
+        if (!activeServiceIdsOn(serviceDate, indexes).contains(trip.serviceId())) {
+            return List.of();
+        }
+
+        Path stopTimesPath = dataDir.resolve("stop_times.txt");
+        if (!Files.exists(stopTimesPath)) {
+            return List.of();
+        }
+
+        long serviceStartEpochSeconds = serviceDate.atStartOfDay(ROME_ZONE).toEpochSecond();
+        List<ScheduledTripStop> out = new ArrayList<>();
+        try (InputStream is = new BufferedInputStream(Files.newInputStream(stopTimesPath))) {
+            CsvParser parser = newParser();
+            parser.beginParsing(is, StandardCharsets.UTF_8);
+            Record r;
+            while ((r = parser.parseNextRecord()) != null) {
+                if (!trip.tripId().equals(r.getString("trip_id"))) continue;
+
+                Integer arrivalTimeSeconds = parseGtfsTimeToSeconds(r.getString("arrival_time"));
+                Integer departureTimeSeconds = parseGtfsTimeToSeconds(r.getString("departure_time"));
+                String stopId = r.getString("stop_id");
+                Stop stop = stopByIdOrNull(stopId);
+
+                out.add(new ScheduledTripStop(
+                        stopId,
+                        stop != null ? stop.name() : null,
+                        trip.tripId(),
+                        publicLineByRouteId(trip.routeId()),
+                        stop != null && stop.lat() != null ? stop.lat().doubleValue() : null,
+                        stop != null && stop.lon() != null ? stop.lon().doubleValue() : null,
+                        toInstantOrNull(serviceStartEpochSeconds, arrivalTimeSeconds),
+                        toInstantOrNull(serviceStartEpochSeconds, departureTimeSeconds)
+                ));
+            }
+            parser.stopParsing();
+        } catch (IOException e) {
+            log.error("[GTFS-Index] Errore leggendo stop_times completi per trip {}: {}", trip.tripId(), e.toString());
             return List.of();
         }
 

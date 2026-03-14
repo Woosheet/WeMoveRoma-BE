@@ -13,7 +13,7 @@ services:
       - ./logs:/app/logs
 
     environment:
-      SPRING_PROFILES_ACTIVE: "prod"
+      SPRING_PROFILES_ACTIVE: "local"
 
       LOGGING_FILE_NAME: "/app/logs/app.log"
 
