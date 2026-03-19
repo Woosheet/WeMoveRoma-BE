@@ -17,19 +17,23 @@ import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.OffsetDateTime;
+import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class JourneyPlannerService {
     private static final int MAX_OTP_OPTIONS = 12;
+    private static final Set<String> SUPPORTED_TRANSIT_MODES = Set.of("BUS", "SUBWAY", "TRAM", "RAIL");
     private static final String OTP_GTFS_GRAPHQL_QUERY_TEMPLATE = """
             {
               planConnection(
@@ -37,6 +41,7 @@ public class JourneyPlannerService {
                 destination: { label: "%s", location: { coordinate: { latitude: %s, longitude: %s } } }
                 dateTime: { %s: "%s" }
                 searchWindow: "PT60M"
+                %s
                 first: %d
               ) {
                 edges {
@@ -98,7 +103,8 @@ public class JourneyPlannerService {
             String toLabel,
             Integer numItineraries,
             String timeMode,
-            String when
+            String when,
+            String modes
     ) {
         JourneyLocationDTO from = new JourneyLocationDTO(fromLat, fromLon, fromLabel);
         JourneyLocationDTO to = new JourneyLocationDTO(toLat, toLon, toLabel);
@@ -120,6 +126,7 @@ public class JourneyPlannerService {
             URI uri = resolveOtpGraphQlUri();
             Instant now = Instant.now();
             TimePreference preference = resolveTimePreference(timeMode, when, now);
+            String modesClause = buildModesClause(modes);
             String query = OTP_GTFS_GRAPHQL_QUERY_TEMPLATE.formatted(
                     escapeGraphqlString(firstNonBlank(fromLabel, "Partenza")),
                     trimDecimals(fromLat),
@@ -129,6 +136,7 @@ public class JourneyPlannerService {
                     trimDecimals(toLon),
                     preference.graphQlField(),
                     preference.when().toString(),
+                    modesClause,
                     upstreamLimit
             );
 
@@ -185,6 +193,27 @@ public class JourneyPlannerService {
                 .path("/otp/gtfs/v1")
                 .build(true)
                 .toUri();
+    }
+
+    private String buildModesClause(String requestedModes) {
+        LinkedHashSet<String> normalizedModes = Arrays.stream(firstNonBlank(requestedModes, "").split(","))
+                .map(String::trim)
+                .filter(value -> !value.isEmpty())
+                .map(value -> value.toUpperCase(Locale.ROOT))
+                .filter(SUPPORTED_TRANSIT_MODES::contains)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+
+        if (normalizedModes.isEmpty()) {
+            return "";
+        }
+        if (normalizedModes.size() == SUPPORTED_TRANSIT_MODES.size() && normalizedModes.containsAll(SUPPORTED_TRANSIT_MODES)) {
+            return "";
+        }
+
+        String modesLiteral = normalizedModes.stream()
+                .map(mode -> "{mode: " + mode + "}")
+                .collect(Collectors.joining(", "));
+        return "modes: { transit: { transit: [" + modesLiteral + "] } }";
     }
 
     @SuppressWarnings("unchecked")
