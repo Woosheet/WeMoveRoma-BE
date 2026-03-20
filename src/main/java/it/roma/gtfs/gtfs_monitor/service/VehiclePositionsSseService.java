@@ -211,10 +211,6 @@ public class VehiclePositionsSseService {
 
         GtfsIndexService.ShapePoint a = shape.get(lowerIndex);
         GtfsIndexService.ShapePoint b = shape.get(upperIndex);
-        if (a.lat() == null || a.lon() == null || b.lat() == null || b.lon() == null) {
-            return null;
-        }
-
         double lat = a.lat() + (b.lat() - a.lat()) * fraction;
         double lon = a.lon() + (b.lon() - a.lon()) * fraction;
         return new Position(lat, lon);

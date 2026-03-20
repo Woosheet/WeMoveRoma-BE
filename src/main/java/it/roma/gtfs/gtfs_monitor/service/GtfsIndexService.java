@@ -53,7 +53,7 @@ public class GtfsIndexService {
         Map<String, Stop> stops = loadStops(stopsPath);
         Map<String, String> routeShortNames = loadRouteShortNames(routesPath);
         Map<String, Trip> trips = loadTrips(tripsPath);
-        Map<String, List<ShapePoint>> shapesById = loadShapes(shapesPath);
+        Map<String, List<ShapePoint>> shapesById = loadShapes(shapesPath, referencedShapeIds(trips));
         CalendarDatesIndex calendarDates = loadCalendarDates(calendarDatesPath);
         Map<String, Set<String>> byRoute = buildRouteIndex(trips);
         Map<String, Set<String>> destinationsByRoute = buildDestinationsIndex(trips);
@@ -399,8 +399,8 @@ public class GtfsIndexService {
         return out;
     }
 
-    private Map<String, List<ShapePoint>> loadShapes(Path p) throws IOException {
-        Map<String, List<ShapePoint>> out = new HashMap<>(32_000);
+    private Map<String, List<ShapePoint>> loadShapes(Path p, Set<String> referencedShapeIds) throws IOException {
+        Map<String, List<ShapePoint>> out = new HashMap<>(Math.max(16, referencedShapeIds.size()));
         if (!Files.exists(p)) {
             log.warn("[GTFS-Index] shapes.txt non trovato in {}", p);
             return out;
@@ -412,6 +412,7 @@ public class GtfsIndexService {
             while ((r = parser.parseNextRecord()) != null) {
                 String shapeId = r.getString("shape_id");
                 if (shapeId == null || shapeId.isBlank()) continue;
+                if (!referencedShapeIds.isEmpty() && !referencedShapeIds.contains(shapeId)) continue;
                 Float lat = parseFloatOrNull(r.getString("shape_pt_lat"));
                 Float lon = parseFloatOrNull(r.getString("shape_pt_lon"));
                 Integer seq = parseIntOrNull(r.getString("shape_pt_sequence"));
@@ -484,6 +485,16 @@ public class GtfsIndexService {
         return out;
     }
 
+    private Set<String> referencedShapeIds(Map<String, Trip> trips) {
+        Set<String> shapeIds = new HashSet<>(Math.max(16, trips.size() / 2));
+        for (Trip trip : trips.values()) {
+            if (trip.shapeId() != null && !trip.shapeId().isBlank()) {
+                shapeIds.add(trip.shapeId());
+            }
+        }
+        return shapeIds;
+    }
+
     private void collectScheduledArrivals(
             List<ScheduledArrival> out,
             String stopId,
@@ -492,6 +503,7 @@ public class GtfsIndexService {
             long horizonEndEpochSeconds,
             int limit
     ) {
+        Indexes indexes = ref.get();
         ScheduledStopIndex index = scheduledStopIndexForDate(serviceDate);
         List<ScheduledStopTime> stopTimes = index.byStopId().get(stopId);
         if (stopTimes == null || stopTimes.isEmpty()) {
@@ -507,15 +519,16 @@ public class GtfsIndexService {
             if (etaEpochSeconds > horizonEndEpochSeconds) {
                 break;
             }
+            Trip trip = indexes.trips().get(stopTime.tripId());
             out.add(new ScheduledArrival(
-                    publicLineByRouteId(stopTime.routeId()),
-                    stopTime.headsign(),
+                    trip != null ? publicLineByRouteId(trip.routeId()) : null,
+                    trip != null ? trip.headsign() : null,
                     stopTime.tripId(),
                     stopId,
                     toInstantOrNull(serviceStartEpochSeconds, stopTime.arrivalTimeSeconds()),
                     toInstantOrNull(serviceStartEpochSeconds, stopTime.departureTimeSeconds()),
                     (int) Math.max(0L, Math.round((etaEpochSeconds - nowEpochSeconds) / 60.0)),
-                    wheelchairAccessible(stopTime.wheelchair())
+                    wheelchairAccessible(trip != null ? trip.wheelchair() : null)
             ));
             if (out.size() >= limit) {
                 return;
@@ -595,13 +608,10 @@ public class GtfsIndexService {
                 Trip trip = indexes.trips().get(tripId);
                 if (trip == null) continue;
 
-                byStopId.computeIfAbsent(stopId, ignored -> new ArrayList<>()).add(new ScheduledStopTime(
+                byStopId.computeIfAbsent(stopId, ignored -> new ArrayList<>(8)).add(new ScheduledStopTime(
                         tripId,
-                        trip.routeId(),
-                        trip.headsign(),
-                        trip.wheelchair(),
-                        arrivalTimeSeconds,
-                        departureTimeSeconds,
+                        arrivalTimeSeconds != null ? arrivalTimeSeconds : -1,
+                        departureTimeSeconds != null ? departureTimeSeconds : -1,
                         bestTimeSeconds
                 ));
             }
@@ -962,6 +972,11 @@ public class GtfsIndexService {
 
     private static Instant toInstantOrNull(long serviceStartEpochSeconds, Integer timeSeconds) {
         if (timeSeconds == null) return null;
+        return toInstantOrNull(serviceStartEpochSeconds, timeSeconds.intValue());
+    }
+
+    private static Instant toInstantOrNull(long serviceStartEpochSeconds, int timeSeconds) {
+        if (timeSeconds < 0) return null;
         return Instant.ofEpochSecond(serviceStartEpochSeconds + timeSeconds);
     }
 
@@ -1032,9 +1047,9 @@ public class GtfsIndexService {
     ) {}
 
     public record ShapePoint(
-            Float lat,
-            Float lon,
-            Integer sequence
+            float lat,
+            float lon,
+            int sequence
     ) {}
 
     public record ScheduledArrival(
@@ -1055,11 +1070,8 @@ public class GtfsIndexService {
 
     private record ScheduledStopTime(
             String tripId,
-            String routeId,
-            String headsign,
-            Integer wheelchair,
-            Integer arrivalTimeSeconds,
-            Integer departureTimeSeconds,
+            int arrivalTimeSeconds,
+            int departureTimeSeconds,
             int bestTimeSeconds
     ) {}
 

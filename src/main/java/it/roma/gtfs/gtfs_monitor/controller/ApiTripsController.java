@@ -26,8 +26,8 @@ public class ApiTripsController {
     public ApiTripShapeDTO shape(@PathVariable String tripId) {
         List<ApiTripShapeDTO.Point> points = gtfsIndexService.shapeByTripId(tripId).stream()
                 .map(p -> new ApiTripShapeDTO.Point(
-                        p.lat() != null ? p.lat().doubleValue() : null,
-                        p.lon() != null ? p.lon().doubleValue() : null,
+                        (double) p.lat(),
+                        (double) p.lon(),
                         p.sequence()))
                 .toList();
         log.debug("GET /api/v1/trips/{}/shape -> {} points", tripId, points.size());
