@@ -28,14 +28,22 @@ public class GeocodeSearchService {
         if (q.isBlank()) return List.of();
         int cappedLimit = limit == null || limit <= 0 ? 5 : Math.min(limit, 10);
         int upstreamLimit = Math.max(cappedLimit * 3, 10);
+        log.info("[GeocodeSearch] start q='{}' limit={} biasLat={} biasLon={}", q, cappedLimit, biasLat, biasLon);
 
         try {
             List<String> queries = queryVariants(q);
+            log.info("[GeocodeSearch] variants for '{}': {}", q, queries);
 
             Map<String, RankedResult> dedup = new LinkedHashMap<>();
             for (int queryIndex = 0; queryIndex < queries.size(); queryIndex++) {
                 String qVariant = queries.get(queryIndex);
                 List<Map<String, Object>> payload = fetchNominatim(qVariant, upstreamLimit);
+                int payloadSize = payload == null ? 0 : payload.size();
+                log.info("[GeocodeSearch] variant {}/{} '{}' -> upstream {} result(s)",
+                        queryIndex + 1,
+                        queries.size(),
+                        qVariant,
+                        payloadSize);
                 if (payload == null) continue;
 
                 for (Map<String, Object> row : payload) {
@@ -59,13 +67,15 @@ public class GeocodeSearchService {
                     }
                 }
             }
-            return dedup.values().stream()
+            List<GeocodeSearchResultDTO> results = dedup.values().stream()
                     .sorted(Comparator.comparingInt(v -> v.score))
                     .map(v -> v.result)
                     .limit(cappedLimit)
                     .toList();
+            log.info("[GeocodeSearch] done q='{}' -> {} result(s) after filtering/dedup", q, results.size());
+            return results;
         } catch (Exception e) {
-            log.debug("[GeocodeSearch] search failed for '{}': {}", q, e.toString());
+            log.warn("[GeocodeSearch] failed q='{}': {}", q, e.toString(), e);
             return List.of();
         }
     }
