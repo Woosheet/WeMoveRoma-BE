@@ -216,9 +216,9 @@ public class JourneyPlannerService {
         }
 
         String modesLiteral = normalizedModes.stream()
-                .map(mode -> "{mode: " + mode + "}")
+                .map(mode -> "{ mode: " + mode + " }")
                 .collect(Collectors.joining(", "));
-        return "modes: { direct: [WALK], transitOnly: true, transit: { transit: [" + modesLiteral + "] } }";
+        return "modes: { transitOnly: true, transit: { access: [WALK], egress: [WALK], transfer: WALK, transit: [" + modesLiteral + "] } }";
     }
 
     @SuppressWarnings("unchecked")

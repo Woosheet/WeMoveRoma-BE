@@ -6,6 +6,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 
+import java.text.Normalizer;
 import java.time.Duration;
 import java.util.*;
 
@@ -175,7 +176,9 @@ public class GeocodeSearchService {
 
         String qHouse = extractHouseNumberToken(query);
         String qStreet = normalizeStreetQuery(query);
+        String qStreetCore = stripStreetTypePrefix(qStreet);
         String roadNorm = normalizeKey(road);
+        String roadCore = stripStreetTypePrefix(roadNorm);
         String houseNorm = normalizeHouseNumber(houseNumber);
         String qHouseNorm = normalizeHouseNumber(qHouse);
 
@@ -183,6 +186,9 @@ public class GeocodeSearchService {
             if (roadNorm.equals(qStreet)) score -= 350;
             else if (roadNorm.startsWith(qStreet)) score -= 240;
             else if (roadNorm.contains(qStreet)) score -= 120;
+            else if (roadCore.equals(qStreetCore)) score -= 210;
+            else if (!qStreetCore.isBlank() && roadCore.startsWith(qStreetCore)) score -= 140;
+            else if (!qStreetCore.isBlank() && roadCore.contains(qStreetCore)) score -= 80;
         }
 
         if (qHouseNorm != null) {
@@ -234,16 +240,21 @@ public class GeocodeSearchService {
 
     private static List<String> queryVariants(String query) {
         LinkedHashSet<String> variants = new LinkedHashSet<>();
-        variants.add(query.trim());
+        String trimmed = query.trim();
+        variants.add(trimmed);
 
         String normalizedSpaces = query.replaceAll("[,;]+", " ").replaceAll("\\s+", " ").trim();
         variants.add(normalizedSpaces);
 
         String expanded = normalizedSpaces
+                .replace('’', '\'')
+                .replaceAll("(?i)\\bp\\.zza\\b", "piazza")
                 .replaceAll("(?i)\\bp\\.za\\b", "piazza")
                 .replaceAll("(?i)\\bv\\.le\\b", "viale")
+                .replaceAll("(?i)\\bviale\\b", "viale")
                 .replaceAll("(?i)\\bv\\.?\\b", "via")
                 .replaceAll("(?i)\\bl\\.go\\b", "largo")
+                .replaceAll("(?i)\\bc\\.so\\b", "corso")
                 .replaceAll("(?i)\\bstaz\\.ne\\b", "stazione");
         variants.add(expanded);
 
@@ -265,7 +276,20 @@ public class GeocodeSearchService {
             if (!withoutHouse.toLowerCase().contains("roma")) variants.add(withoutHouse + " Roma");
         }
 
-        return variants.stream().filter(v -> v != null && !v.isBlank()).limit(5).toList();
+        String streetCore = stripStreetTypePrefix(normalizeKey(expanded));
+        String streetCoreQuery = denormalizeForQuery(streetCore);
+        if (streetCoreQuery != null && !streetCoreQuery.isBlank() && !streetCoreQuery.equalsIgnoreCase(expanded)) {
+            variants.add(streetCoreQuery);
+            variants.add("via " + streetCoreQuery);
+            variants.add("viale " + streetCoreQuery);
+            variants.add("piazza " + streetCoreQuery);
+            if (!streetCoreQuery.toLowerCase(Locale.ROOT).contains("roma")) {
+                variants.add(streetCoreQuery + " Roma");
+                variants.add("via " + streetCoreQuery + " Roma");
+            }
+        }
+
+        return variants.stream().filter(v -> v != null && !v.isBlank()).limit(8).toList();
     }
 
     private static String extractHouseNumberToken(String query) {
@@ -334,7 +358,7 @@ public class GeocodeSearchService {
 
     private static boolean looksLikeAddressQuery(String query) {
         if (query == null) return false;
-        String q = query.toLowerCase(Locale.ROOT).trim();
+        String q = normalizeKey(query);
         if (q.isBlank()) return false;
         if (q.matches(".*\\d+[a-z]{0,3}.*")) return true;
         return q.contains("via ")
@@ -348,11 +372,24 @@ public class GeocodeSearchService {
     }
 
     private static String normalizeKey(String value) {
-        return Objects.toString(value, "")
+        String normalized = Normalizer.normalize(Objects.toString(value, ""), Normalizer.Form.NFD)
+                .replaceAll("\\p{M}+", "");
+        return normalized
                 .toLowerCase()
                 .replaceAll("[^\\p{L}\\p{N}\\s]", " ")
                 .replaceAll("\\s+", " ")
                 .trim();
+    }
+
+    private static String stripStreetTypePrefix(String value) {
+        String normalized = normalizeKey(value);
+        return normalized.replaceFirst("^(via|viale|piazza|largo|corso|vicolo|lungotevere|circonvallazione)\\s+", "").trim();
+    }
+
+    private static String denormalizeForQuery(String value) {
+        if (value == null) return null;
+        String out = value.replaceAll("\\s+", " ").trim();
+        return out.isBlank() ? null : out;
     }
 
     private static Double parseDouble(Object value) {
