@@ -27,6 +27,8 @@ import java.util.zip.ZipFile;
 @Slf4j
 @Service
 public class StaticGtfsUpdater {
+    private record AtomicSwapContext(Path targetDir, Path backupDir, boolean hadPreviousTarget) {}
+
 
     private final GtfsProperties props;
     private final WebClient http;
@@ -173,29 +175,40 @@ public class StaticGtfsUpdater {
             Path targetDir = Path.of(props.staticProps().dataDir());
             log.info("[StaticGTFS] Estrazione zip in directory: {}", targetDir);
 
-            extractZipAtomically(tmp, targetDir);
+            AtomicSwapContext swap = extractZipAtomically(tmp, targetDir);
             log.info("[StaticGTFS] Estrazione completata");
 
-            Files.deleteIfExists(tmp);
-            log.info("[StaticGTFS] File temporaneo eliminato");
+            try {
+                log.info("[StaticGTFS] Ricostruzione indici in corso");
+                indexService.rebuildIndexes();
+                log.info("[StaticGTFS] Indici ricostruiti correttamente");
 
-            log.info("[StaticGTFS] Ricostruzione indici in corso");
-            indexService.rebuildIndexes();
-            log.info("[StaticGTFS] Indici ricostruiti correttamente");
+                finalizeAtomicSwap(swap);
 
-            // QUI consideriamo il refresh riuscito → stop retry
-            refreshFailed = false;
+                // QUI consideriamo il refresh riuscito → stop retry
+                refreshFailed = false;
+            } catch (Throwable t) {
+                log.error("[StaticGTFS] Ricostruzione indici fallita, ripristino backup: {}", t.toString());
+                refreshFailed = true;
+                restoreAtomicSwap(swap);
+                throw t;
+            } finally {
+                Files.deleteIfExists(tmp);
+                log.info("[StaticGTFS] File temporaneo eliminato");
+            }
 
-        } catch (Exception e) {
+        } catch (Throwable e) {
             log.error("[StaticGTFS] Errore durante estrazione zip: {}", e.toString());
-            // fallimento → lasciamo refreshFailed = true per attivare i retry ogni 5'
             refreshFailed = true;
+            if (e instanceof Error err) {
+                throw err;
+            }
         }
 
         return Mono.empty();
     }
 
-    private void extractZipAtomically(Path zipPath, Path targetDir) throws IOException {
+    private AtomicSwapContext extractZipAtomically(Path zipPath, Path targetDir) throws IOException {
 
         log.info("[StaticGTFS] Estrazione ZIP atomica iniziata. zipPath={} targetDir={}", zipPath, targetDir);
 
@@ -249,16 +262,34 @@ public class StaticGtfsUpdater {
 
         log.info("[StaticGTFS] Promozione newDir a targetDir tramite atomic move");
         Files.move(newDir, targetDir, StandardCopyOption.ATOMIC_MOVE);
+        log.info("[StaticGTFS] Estrazione ZIP atomica completata, backup mantenuto fino a rebuild completato");
+        return new AtomicSwapContext(targetDir, backup, Files.exists(backup));
+    }
 
-        if (Files.exists(backup)) {
+    private void finalizeAtomicSwap(AtomicSwapContext swap) throws IOException {
+        if (Files.exists(swap.backupDir())) {
             log.info("[StaticGTFS] Rimozione backup");
-            deleteRecursively(backup);
+            deleteRecursively(swap.backupDir());
         }
 
         log.info("[StaticGTFS] Salvataggio stato JSON");
         saveStateJson();
+    }
 
-        log.info("[StaticGTFS] Estrazione ZIP atomica completata");
+    private void restoreAtomicSwap(AtomicSwapContext swap) {
+        try {
+            if (Files.exists(swap.targetDir())) {
+                log.warn("[StaticGTFS] Rimozione target fallito prima del restore");
+                deleteRecursively(swap.targetDir());
+            }
+
+            if (swap.hadPreviousTarget() && Files.exists(swap.backupDir())) {
+                log.warn("[StaticGTFS] Ripristino backup in {}", swap.targetDir());
+                Files.move(swap.backupDir(), swap.targetDir(), StandardCopyOption.ATOMIC_MOVE);
+            }
+        } catch (IOException restoreError) {
+            log.error("[StaticGTFS] Ripristino backup fallito: {}", restoreError.toString());
+        }
     }
 
     private void deleteRecursively(Path p) throws IOException {

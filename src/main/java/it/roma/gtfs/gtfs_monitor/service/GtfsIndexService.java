@@ -304,7 +304,10 @@ public class GtfsIndexService {
         s.setNullValue("");
         s.setEmptyValue("");
         s.getFormat().setDelimiter(',');
-        s.setMaxCharsPerColumn(1 << 20);
+        // GTFS fields should stay small; keep a sane ceiling so a malformed feed row
+        // fails fast instead of exhausting heap while univocity builds giant strings.
+        s.setMaxCharsPerColumn(1 << 14);
+        s.setErrorContentLength(120);
         return new CsvParser(s);
     }
 
