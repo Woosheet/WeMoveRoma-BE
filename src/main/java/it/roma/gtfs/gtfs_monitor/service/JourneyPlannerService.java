@@ -178,7 +178,12 @@ public class JourneyPlannerService {
             String error = options.isEmpty() ? "Nessun percorso trovato." : null;
             return new JourneyPlanResponseDTO("otp", from, to, options, error, now);
         } catch (Exception e) {
-            log.debug("[JourneyPlanner] OTP GraphQL request failed: {}", e.toString());
+            log.warn("[JourneyPlanner] OTP GraphQL request failed for {} -> {} with modes={}: {}",
+                    fromLabel,
+                    toLabel,
+                    modes,
+                    e.toString(),
+                    e);
             return new JourneyPlanResponseDTO(
                     "otp", from, to, List.of(),
                     "Trip planner non raggiungibile. Verifica server OTP.",
@@ -213,7 +218,7 @@ public class JourneyPlannerService {
         String modesLiteral = normalizedModes.stream()
                 .map(mode -> "{mode: " + mode + "}")
                 .collect(Collectors.joining(", "));
-        return "modes: { transit: { transit: [" + modesLiteral + "] } }";
+        return "modes: { direct: [WALK], transitOnly: true, transit: { transit: [" + modesLiteral + "] } }";
     }
 
     @SuppressWarnings("unchecked")

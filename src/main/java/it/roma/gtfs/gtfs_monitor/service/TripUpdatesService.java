@@ -1,5 +1,6 @@
 package it.roma.gtfs.gtfs_monitor.service;
 
+import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.transit.realtime.GtfsRealtime;
 import it.roma.gtfs.gtfs_monitor.config.GtfsProperties;
 import it.roma.gtfs.gtfs_monitor.model.dto.TripUpdateDTO;
@@ -8,6 +9,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
@@ -22,6 +25,7 @@ import static it.roma.gtfs.gtfs_monitor.utils.DelayFmt.*;
 public class TripUpdatesService {
     private static final long DEFAULT_REFRESH_MILLIS = 5_000L;
     private static final int MAX_LIMIT = 5_000;
+    private static final long RETRY_BACKOFF_MILLIS = 400L;
 
     private final GtfsProperties props;
     private final WebClient webClient;
@@ -135,6 +139,37 @@ public class TripUpdatesService {
 
     private List<TripUpdateDTO> fetchRemoteSnapshot() {
         String url = props.realtime().tripUpdatesUrl();
+        if (url == null || url.isBlank()) {
+            throw new IllegalStateException("gtfs.realtime.tripUpdatesUrl mancante");
+        }
+
+        int attempt = 1;
+        while (true) {
+            try {
+                return fetchRemoteSnapshotOnce(url);
+            } catch (InvalidProtocolBufferException e) {
+                if (attempt >= 2) {
+                    log.error("[TripUpdates] parse error anche al retry: {}", e.toString());
+                    return List.of();
+                }
+                log.warn("[TripUpdates] protobuf corrotto (tentativo {}), retry immediato: {}", attempt, e.toString());
+            } catch (WebClientResponseException.BadGateway | WebClientRequestException e) {
+                if (attempt >= 2) {
+                    log.warn("[TripUpdates] refresh cache fallito anche al retry: {}", e.toString());
+                    return List.of();
+                }
+                log.warn("[TripUpdates] upstream temporaneamente non disponibile (tentativo {}), retry immediato: {}", attempt, e.toString());
+            } catch (Exception e) {
+                log.error("[TripUpdates] fetch/parsing error: {}", e.toString());
+                return List.of();
+            }
+
+            attempt++;
+            sleepBeforeRetry();
+        }
+    }
+
+    private List<TripUpdateDTO> fetchRemoteSnapshotOnce(String url) throws InvalidProtocolBufferException {
         byte[] body = webClient.get().uri(url)
                 .retrieve()
                 .bodyToMono(byte[].class)
@@ -145,57 +180,58 @@ public class TripUpdatesService {
             return List.of();
         }
 
-        try {
-            var feed = GtfsRealtime.FeedMessage.parseFrom(body);
-            List<TripUpdateDTO> out = new ArrayList<>(Math.max(32, feed.getEntityCount()));
+        var feed = GtfsRealtime.FeedMessage.parseFrom(body);
+        List<TripUpdateDTO> out = new ArrayList<>(Math.max(32, feed.getEntityCount()));
 
-            for (var ent : feed.getEntityList()) {
-                if (!ent.hasTripUpdate()) continue;
+        for (var ent : feed.getEntityList()) {
+            if (!ent.hasTripUpdate()) continue;
 
-                var tu = ent.getTripUpdate();
-                String routeId = tu.getTrip().getRouteId();
-                String tripId  = tu.getTrip().getTripId();
-                String vehId   = tu.hasVehicle() ? tu.getVehicle().getId() : null;
+            var tu = ent.getTripUpdate();
+            String routeId = tu.getTrip().getRouteId();
+            String tripId  = tu.getTrip().getTripId();
+            String vehId   = tu.hasVehicle() ? tu.getVehicle().getId() : null;
 
-                for (var stu : tu.getStopTimeUpdateList()) {
-                    String stopId = stu.getStopId();
+            for (var stu : tu.getStopTimeUpdateList()) {
+                String stopId = stu.getStopId();
 
-                    Long arrEpoch = (stu.hasArrival() && stu.getArrival().hasTime()) ? stu.getArrival().getTime() : null;
-                    Long depEpoch = (stu.hasDeparture() && stu.getDeparture().hasTime()) ? stu.getDeparture().getTime() : null;
+                Long arrEpoch = (stu.hasArrival() && stu.getArrival().hasTime()) ? stu.getArrival().getTime() : null;
+                Long depEpoch = (stu.hasDeparture() && stu.getDeparture().hasTime()) ? stu.getDeparture().getTime() : null;
 
-                    String arrivo   = toRomeIso(arrEpoch);
-                    String partenza = toRomeIso(depEpoch);
+                String arrivo   = toRomeIso(arrEpoch);
+                String partenza = toRomeIso(depEpoch);
 
-                    Double ritArrMin = (stu.hasArrival() && stu.getArrival().hasDelay()) ? round1(stu.getArrival().getDelay() / 60.0) : null;
-                    Double ritPartMin = (stu.hasDeparture() && stu.getDeparture().hasDelay()) ? round1(stu.getDeparture().getDelay() / 60.0) : null;
+                Double ritArrMin = (stu.hasArrival() && stu.getArrival().hasDelay()) ? round1(stu.getArrival().getDelay() / 60.0) : null;
+                Double ritPartMin = (stu.hasDeparture() && stu.getDeparture().hasDelay()) ? round1(stu.getDeparture().getDelay() / 60.0) : null;
 
-                    String descArr   = formatDelay(ritArrMin);
-                    String descPart  = formatDelay(ritPartMin);
+                String descArr   = formatDelay(ritArrMin);
+                String descPart  = formatDelay(ritPartMin);
 
-                    GtfsIndexService.Stop stop = indexService.stopByIdOrNull(stopId);
-                    String nomeFermata = (stop != null) ? stop.name() : null;
+                GtfsIndexService.Stop stop = indexService.stopByIdOrNull(stopId);
+                String nomeFermata = (stop != null) ? stop.name() : null;
 
-
-                    out.add(TripUpdateDTO.builder()
-                            .linea(routeId)
-                            .corsa(tripId)
-                            .veicolo(vehId)
-                            .fermataId(stopId)
-                            .fermataNome(nomeFermata)
-                            .arrivo(arrivo)
-                            .partenza(partenza)
-                            .ritardoArrivoMin(ritArrMin)
-                            .ritardoPartenzaMin(ritPartMin)
-                            .descArrivo(descArr)
-                            .descPartenza(descPart)
-                            .build());
-                }
+                out.add(TripUpdateDTO.builder()
+                        .linea(routeId)
+                        .corsa(tripId)
+                        .veicolo(vehId)
+                        .fermataId(stopId)
+                        .fermataNome(nomeFermata)
+                        .arrivo(arrivo)
+                        .partenza(partenza)
+                        .ritardoArrivoMin(ritArrMin)
+                        .ritardoPartenzaMin(ritPartMin)
+                        .descArrivo(descArr)
+                        .descPartenza(descPart)
+                        .build());
             }
-            return out;
+        }
+        return out;
+    }
 
-        } catch (Exception e) {
-            log.error("[TripUpdates] parse error: {}", e.toString());
-            return List.of();
+    private static void sleepBeforeRetry() {
+        try {
+            Thread.sleep(RETRY_BACKOFF_MILLIS);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
         }
     }
 
