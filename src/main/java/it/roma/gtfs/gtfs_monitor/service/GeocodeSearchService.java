@@ -4,11 +4,13 @@ import it.roma.gtfs.gtfs_monitor.model.dto.GeocodeSearchResultDTO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 import org.springframework.web.reactive.function.client.WebClient;
 
 import java.text.Normalizer;
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @Service
@@ -19,8 +21,12 @@ public class GeocodeSearchService {
     private static final double ROME_MAX_LON = 12.90;
     private static final double ROME_MIN_LAT = 41.65;
     private static final double ROME_MAX_LAT = 42.15;
+    private static final long SEARCH_CACHE_TTL_MILLIS = 30_000L;
+    private static final long UPSTREAM_CACHE_TTL_MILLIS = 120_000L;
 
     private final WebClient webClient;
+    private final Map<String, TimedValue<List<GeocodeSearchResultDTO>>> searchCache = new ConcurrentHashMap<>();
+    private final Map<String, TimedValue<List<Map<String, Object>>>> upstreamCache = new ConcurrentHashMap<>();
 
     @SuppressWarnings("unchecked")
     public List<GeocodeSearchResultDTO> search(String query, Integer limit, Double biasLat, Double biasLon) {
@@ -28,22 +34,34 @@ public class GeocodeSearchService {
         if (q.isBlank()) return List.of();
         int cappedLimit = limit == null || limit <= 0 ? 5 : Math.min(limit, 10);
         int upstreamLimit = Math.max(cappedLimit * 3, 10);
+        String cacheKey = buildSearchCacheKey(q, cappedLimit, biasLat, biasLon);
         log.info("[GeocodeSearch] start q='{}' limit={} biasLat={} biasLon={}", q, cappedLimit, biasLat, biasLon);
+
+        List<GeocodeSearchResultDTO> cachedResult = getCached(searchCache, cacheKey, SEARCH_CACHE_TTL_MILLIS);
+        if (cachedResult != null) {
+            log.info("[GeocodeSearch] cache hit q='{}' -> {} result(s)", q, cachedResult.size());
+            return cachedResult;
+        }
 
         try {
             List<String> queries = queryVariants(q);
             log.info("[GeocodeSearch] variants for '{}': {}", q, queries);
 
             Map<String, RankedResult> dedup = new LinkedHashMap<>();
+            boolean rateLimited = false;
             for (int queryIndex = 0; queryIndex < queries.size(); queryIndex++) {
                 String qVariant = queries.get(queryIndex);
-                List<Map<String, Object>> payload = fetchNominatim(qVariant, upstreamLimit);
+                VariantFetch payloadResult = fetchNominatim(qVariant, upstreamLimit);
+                List<Map<String, Object>> payload = payloadResult.rows();
                 int payloadSize = payload == null ? 0 : payload.size();
                 log.info("[GeocodeSearch] variant {}/{} '{}' -> upstream {} result(s)",
                         queryIndex + 1,
                         queries.size(),
                         qVariant,
                         payloadSize);
+                if (payloadResult.rateLimited()) {
+                    rateLimited = true;
+                }
                 if (payload == null) continue;
 
                 for (Map<String, Object> row : payload) {
@@ -66,41 +84,68 @@ public class GeocodeSearchService {
                         dedup.put(key, candidate);
                     }
                 }
+
+                if (rateLimited) {
+                    log.info("[GeocodeSearch] stop variants early for '{}' after 429 from upstream", q);
+                    break;
+                }
             }
             List<GeocodeSearchResultDTO> results = dedup.values().stream()
                     .sorted(Comparator.comparingInt(v -> v.score))
                     .map(v -> v.result)
                     .limit(cappedLimit)
                     .toList();
+            searchCache.put(cacheKey, new TimedValue<>(results, System.currentTimeMillis()));
             log.info("[GeocodeSearch] done q='{}' -> {} result(s) after filtering/dedup", q, results.size());
             return results;
         } catch (Exception e) {
             log.warn("[GeocodeSearch] failed q='{}': {}", q, e.toString(), e);
+            List<GeocodeSearchResultDTO> staleResult = getCached(searchCache, cacheKey, Long.MAX_VALUE);
+            if (staleResult != null) {
+                log.info("[GeocodeSearch] serving stale cache for '{}' after failure -> {} result(s)", q, staleResult.size());
+                return staleResult;
+            }
             return List.of();
         }
     }
 
     @SuppressWarnings("unchecked")
-    private List<Map<String, Object>> fetchNominatim(String query, int upstreamLimit) {
-        return webClient.get()
-                .uri(uriBuilder -> uriBuilder
-                        .scheme("https")
-                        .host("nominatim.openstreetmap.org")
-                        .path("/search")
-                        .queryParam("format", "jsonv2")
-                        .queryParam("q", query)
-                        .queryParam("limit", upstreamLimit)
-                        .queryParam("addressdetails", 1)
-                        .queryParam("namedetails", 1)
-                        .queryParam("accept-language", "it")
-                        .queryParam("countrycodes", "it")
-                        .queryParam("viewbox", "%s,%s,%s,%s".formatted(ROME_MIN_LON, ROME_MAX_LAT, ROME_MAX_LON, ROME_MIN_LAT))
-                        .queryParam("bounded", 1)
-                        .build())
-                .header("User-Agent", "gtfs-monitor/1.0 (geocode-search)")
-                .retrieve()
-                .bodyToMono(List.class)
-                .block(Duration.ofSeconds(8));
+    private VariantFetch fetchNominatim(String query, int upstreamLimit) {
+        String cacheKey = normalizeKey(query) + "|" + upstreamLimit;
+        try {
+            List<Map<String, Object>> payload = webClient.get()
+                    .uri(uriBuilder -> uriBuilder
+                            .scheme("https")
+                            .host("nominatim.openstreetmap.org")
+                            .path("/search")
+                            .queryParam("format", "jsonv2")
+                            .queryParam("q", query)
+                            .queryParam("limit", upstreamLimit)
+                            .queryParam("addressdetails", 1)
+                            .queryParam("namedetails", 1)
+                            .queryParam("accept-language", "it")
+                            .queryParam("countrycodes", "it")
+                            .queryParam("viewbox", "%s,%s,%s,%s".formatted(ROME_MIN_LON, ROME_MAX_LAT, ROME_MAX_LON, ROME_MIN_LAT))
+                            .queryParam("bounded", 1)
+                            .build())
+                    .header("User-Agent", "gtfs-monitor/1.0 (geocode-search)")
+                    .retrieve()
+                    .bodyToMono(List.class)
+                    .block(Duration.ofSeconds(8));
+            List<Map<String, Object>> safePayload = payload == null ? List.of() : List.copyOf(payload);
+            upstreamCache.put(cacheKey, new TimedValue<>(safePayload, System.currentTimeMillis()));
+            return new VariantFetch(safePayload, false);
+        } catch (WebClientResponseException.TooManyRequests e) {
+            List<Map<String, Object>> stalePayload = getCached(upstreamCache, cacheKey, Long.MAX_VALUE);
+            if (stalePayload != null) {
+                log.warn("[GeocodeSearch] 429 from Nominatim for '{}', using stale upstream cache with {} result(s)",
+                        query,
+                        stalePayload.size());
+                return new VariantFetch(stalePayload, true);
+            }
+            log.warn("[GeocodeSearch] 429 from Nominatim for '{}', no cached fallback available", query);
+            return new VariantFetch(List.of(), true);
+        }
     }
 
     @SuppressWarnings("unchecked")
@@ -402,6 +447,26 @@ public class GeocodeSearchService {
         return out.isBlank() ? null : out;
     }
 
+    private static String buildSearchCacheKey(String query, int limit, Double biasLat, Double biasLon) {
+        return normalizeKey(query)
+                + "|" + limit
+                + "|" + bucketBias(biasLat)
+                + "|" + bucketBias(biasLon);
+    }
+
+    private static String bucketBias(Double value) {
+        if (value == null) return "-";
+        return String.format(Locale.ROOT, "%.3f", value);
+    }
+
+    private static <T> T getCached(Map<String, TimedValue<T>> cache, String key, long ttlMillis) {
+        TimedValue<T> timed = cache.get(key);
+        if (timed == null || timed.value() == null) return null;
+        long age = System.currentTimeMillis() - timed.loadedAtMillis();
+        if (age > ttlMillis) return null;
+        return timed.value();
+    }
+
     private static Double parseDouble(Object value) {
         if (value == null) return null;
         try {
@@ -440,4 +505,6 @@ public class GeocodeSearchService {
     }
 
     private record RankedResult(GeocodeSearchResultDTO result, int score) {}
+    private record TimedValue<T>(T value, long loadedAtMillis) {}
+    private record VariantFetch(List<Map<String, Object>> rows, boolean rateLimited) {}
 }
