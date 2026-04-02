@@ -35,30 +35,19 @@ public class GeocodeSearchService {
         int cappedLimit = limit == null || limit <= 0 ? 5 : Math.min(limit, 10);
         int upstreamLimit = Math.max(cappedLimit * 3, 10);
         String cacheKey = buildSearchCacheKey(q, cappedLimit, biasLat, biasLon);
-        log.info("[GeocodeSearch] start q='{}' limit={} biasLat={} biasLon={}", q, cappedLimit, biasLat, biasLon);
-
         List<GeocodeSearchResultDTO> cachedResult = getCached(searchCache, cacheKey, SEARCH_CACHE_TTL_MILLIS);
         if (cachedResult != null) {
-            log.info("[GeocodeSearch] cache hit q='{}' -> {} result(s)", q, cachedResult.size());
             return cachedResult;
         }
 
         try {
             List<String> queries = queryVariants(q);
-            log.info("[GeocodeSearch] variants for '{}': {}", q, queries);
-
             Map<String, RankedResult> dedup = new LinkedHashMap<>();
             boolean rateLimited = false;
             for (int queryIndex = 0; queryIndex < queries.size(); queryIndex++) {
                 String qVariant = queries.get(queryIndex);
                 VariantFetch payloadResult = fetchNominatim(qVariant, upstreamLimit);
                 List<Map<String, Object>> payload = payloadResult.rows();
-                int payloadSize = payload == null ? 0 : payload.size();
-                log.info("[GeocodeSearch] variant {}/{} '{}' -> upstream {} result(s)",
-                        queryIndex + 1,
-                        queries.size(),
-                        qVariant,
-                        payloadSize);
                 if (payloadResult.rateLimited()) {
                     rateLimited = true;
                 }
@@ -86,7 +75,6 @@ public class GeocodeSearchService {
                 }
 
                 if (rateLimited) {
-                    log.info("[GeocodeSearch] stop variants early for '{}' after 429 from upstream", q);
                     break;
                 }
             }
@@ -96,13 +84,11 @@ public class GeocodeSearchService {
                     .limit(cappedLimit)
                     .toList();
             searchCache.put(cacheKey, new TimedValue<>(results, System.currentTimeMillis()));
-            log.info("[GeocodeSearch] done q='{}' -> {} result(s) after filtering/dedup", q, results.size());
             return results;
         } catch (Exception e) {
             log.warn("[GeocodeSearch] failed q='{}': {}", q, e.toString(), e);
             List<GeocodeSearchResultDTO> staleResult = getCached(searchCache, cacheKey, Long.MAX_VALUE);
             if (staleResult != null) {
-                log.info("[GeocodeSearch] serving stale cache for '{}' after failure -> {} result(s)", q, staleResult.size());
                 return staleResult;
             }
             return List.of();
