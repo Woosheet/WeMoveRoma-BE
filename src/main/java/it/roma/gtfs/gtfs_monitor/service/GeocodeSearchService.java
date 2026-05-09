@@ -6,11 +6,13 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.util.UriBuilder;
 
 import java.text.Normalizer;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 
 @Slf4j
 @Service
@@ -23,6 +25,16 @@ public class GeocodeSearchService {
     private static final double ROME_MAX_LAT = 42.15;
     private static final long SEARCH_CACHE_TTL_MILLIS = 30_000L;
     private static final long UPSTREAM_CACHE_TTL_MILLIS = 120_000L;
+
+    // Comuni della cintura accettati anche se non contengono "roma" nella label/city.
+    private static final Set<String> ROME_METRO_TOWNS = Set.of(
+            "fiumicino", "ciampino", "pomezia", "guidonia montecelio", "guidonia",
+            "tivoli", "albano laziale", "ardea", "anguillara sabazia", "frascati",
+            "grottaferrata", "marino", "mentana", "monterotondo", "monte porzio catone",
+            "nettuno", "anzio", "castel gandolfo", "cerveteri", "ladispoli",
+            "formello", "campagnano di roma", "sacrofano", "rocca di papa", "genzano di roma",
+            "colleferro", "palestrina", "valmontone", "zagarolo", "fonte nuova"
+    );
 
     private final WebClient webClient;
     private final Map<String, TimedValue<List<GeocodeSearchResultDTO>>> searchCache = new ConcurrentHashMap<>();
@@ -41,43 +53,40 @@ public class GeocodeSearchService {
         }
 
         try {
-            List<String> queries = queryVariants(q);
             Map<String, RankedResult> dedup = new LinkedHashMap<>();
             boolean rateLimited = false;
-            for (int queryIndex = 0; queryIndex < queries.size(); queryIndex++) {
-                String qVariant = queries.get(queryIndex);
-                VariantFetch payloadResult = fetchNominatim(qVariant, upstreamLimit);
-                List<Map<String, Object>> payload = payloadResult.rows();
-                if (payloadResult.rateLimited()) {
-                    rateLimited = true;
-                }
-                if (payload == null) continue;
 
-                for (Map<String, Object> row : payload) {
-                    Double lat = parseDouble(row.get("lat"));
-                    Double lon = parseDouble(row.get("lon"));
-                    String label = toStringOrNull(row.get("display_name"));
-                    if (lat == null || lon == null || label == null || label.isBlank()) continue;
-                    if (!isInsideRomeBounds(lat, lon)) continue;
-                    if (!looksLikeRomeResult(row, label)) continue;
-
-                    String normalizedLabel = compactLabel(row, label);
-                    String key = normalizeKey(normalizedLabel);
-                    int score = rankResult(q, row, normalizedLabel, biasLat, biasLon);
-                    score += queryIndex * 35; // query originale sempre preferita rispetto ai fallback
-
-                    String poiName = extractPoiDisplayName(row, normalizedLabel);
-                    RankedResult candidate = new RankedResult(new GeocodeSearchResultDTO(lat, lon, normalizedLabel, poiName), score);
-                    RankedResult prev = dedup.get(key);
-                    if (prev == null || candidate.score < prev.score) {
-                        dedup.put(key, candidate);
-                    }
-                }
-
-                if (rateLimited) {
-                    break;
+            // 1) Tentativo prioritario: structured search (street/city) per indirizzi.
+            //    Nominatim risolve molto meglio civici italiani con i parametri tipizzati.
+            ParsedAddress parsed = parseAddress(q);
+            int variantIndex = 0;
+            if (parsed != null && parsed.street() != null) {
+                List<ParsedAddress> structuredVariants = expandStructuredVariants(parsed);
+                for (ParsedAddress variant : structuredVariants) {
+                    VariantFetch payloadResult = fetchNominatimStructured(variant, upstreamLimit, true);
+                    rateLimited = collectResults(payloadResult, dedup, q, biasLat, biasLon, variantIndex);
+                    variantIndex++;
+                    if (rateLimited) break;
                 }
             }
+
+            // 2) Free-text search con varianti (mantiene la copertura per POI/quartieri/landmark).
+            if (!rateLimited) {
+                List<String> queries = queryVariants(q);
+                for (String qVariant : queries) {
+                    VariantFetch payloadResult = fetchNominatim(qVariant, upstreamLimit, true);
+                    rateLimited = collectResults(payloadResult, dedup, q, biasLat, biasLon, variantIndex);
+                    variantIndex++;
+                    if (rateLimited) break;
+                }
+            }
+
+            // 3) Fallback unbounded se non abbiamo trovato nulla: rilassa il viewbox e ritenta una sola variante.
+            if (!rateLimited && dedup.isEmpty()) {
+                VariantFetch payloadResult = fetchNominatim(q, upstreamLimit, false);
+                collectResults(payloadResult, dedup, q, biasLat, biasLon, variantIndex);
+            }
+
             List<GeocodeSearchResultDTO> results = dedup.values().stream()
                     .sorted(Comparator.comparingInt(v -> v.score))
                     .map(v -> v.result)
@@ -95,25 +104,94 @@ public class GeocodeSearchService {
         }
     }
 
+    /**
+     * Aggrega i risultati di una singola fetch dentro la mappa dedup; ritorna true se rate-limited.
+     */
+    private boolean collectResults(
+            VariantFetch payloadResult,
+            Map<String, RankedResult> dedup,
+            String originalQuery,
+            Double biasLat,
+            Double biasLon,
+            int variantIndex
+    ) {
+        if (payloadResult == null) return false;
+        List<Map<String, Object>> payload = payloadResult.rows();
+        if (payload == null) return payloadResult.rateLimited();
+
+        for (Map<String, Object> row : payload) {
+            Double lat = parseDouble(row.get("lat"));
+            Double lon = parseDouble(row.get("lon"));
+            String label = toStringOrNull(row.get("display_name"));
+            if (lat == null || lon == null || label == null || label.isBlank()) continue;
+            if (!isInsideRomeBounds(lat, lon)) continue;
+            if (!looksLikeRomeResult(row, label)) continue;
+
+            String normalizedLabel = compactLabel(row, label);
+            String key = normalizeKey(normalizedLabel);
+            int score = rankResult(originalQuery, row, normalizedLabel, biasLat, biasLon);
+            score += variantIndex * 35; // varianti precedenti (più rilevanti) sono preferite
+
+            String poiName = extractPoiDisplayName(row, normalizedLabel);
+            RankedResult candidate = new RankedResult(new GeocodeSearchResultDTO(lat, lon, normalizedLabel, poiName), score);
+            RankedResult prev = dedup.get(key);
+            if (prev == null || candidate.score < prev.score) {
+                dedup.put(key, candidate);
+            }
+        }
+        return payloadResult.rateLimited();
+    }
+
     @SuppressWarnings("unchecked")
-    private VariantFetch fetchNominatim(String query, int upstreamLimit) {
-        String cacheKey = normalizeKey(query) + "|" + upstreamLimit;
+    private VariantFetch fetchNominatim(String query, int upstreamLimit, boolean bounded) {
+        String cacheKey = "ft|" + normalizeKey(query) + "|" + upstreamLimit + "|" + bounded;
+        return doFetch(cacheKey, uriBuilder -> uriBuilder
+                .scheme("https")
+                .host("nominatim.openstreetmap.org")
+                .path("/search")
+                .queryParam("format", "jsonv2")
+                .queryParam("q", query)
+                .queryParam("limit", upstreamLimit)
+                .queryParam("addressdetails", 1)
+                .queryParam("namedetails", 1)
+                .queryParam("accept-language", "it")
+                .queryParam("countrycodes", "it")
+                .queryParam("viewbox", "%s,%s,%s,%s".formatted(ROME_MIN_LON, ROME_MAX_LAT, ROME_MAX_LON, ROME_MIN_LAT))
+                .queryParam("bounded", bounded ? 1 : 0)
+                .build(), query);
+    }
+
+    /**
+     * Structured search: usa i parametri tipizzati di Nominatim (street/city).
+     * Funziona molto meglio del freetext per indirizzi italiani con civico.
+     */
+    private VariantFetch fetchNominatimStructured(ParsedAddress address, int upstreamLimit, boolean bounded) {
+        String streetParam = buildStreetParam(address);
+        String cityParam = address.city() != null ? address.city() : "Roma";
+        String cacheKey = "st|" + normalizeKey(streetParam) + "|" + normalizeKey(cityParam) + "|" + upstreamLimit + "|" + bounded;
+        return doFetch(cacheKey, uriBuilder -> uriBuilder
+                .scheme("https")
+                .host("nominatim.openstreetmap.org")
+                .path("/search")
+                .queryParam("format", "jsonv2")
+                .queryParam("street", streetParam)
+                .queryParam("city", cityParam)
+                .queryParam("country", "Italia")
+                .queryParam("limit", upstreamLimit)
+                .queryParam("addressdetails", 1)
+                .queryParam("namedetails", 1)
+                .queryParam("accept-language", "it")
+                .queryParam("countrycodes", "it")
+                .queryParam("viewbox", "%s,%s,%s,%s".formatted(ROME_MIN_LON, ROME_MAX_LAT, ROME_MAX_LON, ROME_MIN_LAT))
+                .queryParam("bounded", bounded ? 1 : 0)
+                .build(), "street=" + streetParam + "&city=" + cityParam);
+    }
+
+    @SuppressWarnings("unchecked")
+    private VariantFetch doFetch(String cacheKey, Function<UriBuilder, java.net.URI> uri, String description) {
         try {
             List<Map<String, Object>> payload = webClient.get()
-                    .uri(uriBuilder -> uriBuilder
-                            .scheme("https")
-                            .host("nominatim.openstreetmap.org")
-                            .path("/search")
-                            .queryParam("format", "jsonv2")
-                            .queryParam("q", query)
-                            .queryParam("limit", upstreamLimit)
-                            .queryParam("addressdetails", 1)
-                            .queryParam("namedetails", 1)
-                            .queryParam("accept-language", "it")
-                            .queryParam("countrycodes", "it")
-                            .queryParam("viewbox", "%s,%s,%s,%s".formatted(ROME_MIN_LON, ROME_MAX_LAT, ROME_MAX_LON, ROME_MIN_LAT))
-                            .queryParam("bounded", 1)
-                            .build())
+                    .uri(uri::apply)
                     .header("User-Agent", "gtfs-monitor/1.0 (geocode-search)")
                     .retrieve()
                     .bodyToMono(List.class)
@@ -125,13 +203,146 @@ public class GeocodeSearchService {
             List<Map<String, Object>> stalePayload = getCached(upstreamCache, cacheKey, Long.MAX_VALUE);
             if (stalePayload != null) {
                 log.warn("[GeocodeSearch] 429 from Nominatim for '{}', using stale upstream cache with {} result(s)",
-                        query,
+                        description,
                         stalePayload.size());
                 return new VariantFetch(stalePayload, true);
             }
-            log.warn("[GeocodeSearch] 429 from Nominatim for '{}', no cached fallback available", query);
+            log.warn("[GeocodeSearch] 429 from Nominatim for '{}', no cached fallback available", description);
             return new VariantFetch(List.of(), true);
         }
+    }
+
+    private static String buildStreetParam(ParsedAddress address) {
+        String street = address.street();
+        String house = address.houseNumber();
+        if (house == null || house.isBlank()) return street;
+        return street + " " + house;
+    }
+
+    /**
+     * Espande la coppia street+house in piccole varianti per coprire le scritture
+     * più comuni dei civici italiani in OSM ("3n", "3/N", "3 N", "3").
+     * La street-only è sempre l'ultima fallback.
+     */
+    private static List<ParsedAddress> expandStructuredVariants(ParsedAddress base) {
+        if (base == null || base.street() == null) return List.of();
+        LinkedHashSet<ParsedAddress> out = new LinkedHashSet<>();
+        out.add(base);
+        String house = base.houseNumber();
+        if (house != null && !house.isBlank()) {
+            for (String hv : houseNumberVariants(house)) {
+                out.add(new ParsedAddress(base.street(), hv, base.city()));
+            }
+            // Fallback street-only: penalizzato in scoring ma utile se OSM non ha quel civico.
+            out.add(new ParsedAddress(base.street(), null, base.city()));
+        }
+        return List.copyOf(out);
+    }
+
+    /**
+     * Genera varianti di un civico italiano:
+     *  - "3n"   → "3n", "3/n", "3 n", "3"
+     *  - "3/N"  → "3/n", "3n", "3 n", "3"
+     *  - "12"   → "12"
+     *  - "12bis" → "12bis", "12 bis", "12"
+     */
+    static List<String> houseNumberVariants(String house) {
+        if (house == null) return List.of();
+        String trimmed = house.trim().toLowerCase(Locale.ROOT);
+        if (trimmed.isBlank()) return List.of();
+        LinkedHashSet<String> out = new LinkedHashSet<>();
+        out.add(trimmed);
+
+        // Estrai parte numerica + suffisso (lettere o "bis"/"ter"/...)
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("^\\s*(\\d+)\\s*[\\-/ ]?\\s*([a-z]{1,4})?\\s*$")
+                .matcher(trimmed.replace("/", " "));
+        if (m.matches()) {
+            String num = m.group(1);
+            String suffix = m.group(2);
+            if (suffix != null && !suffix.isBlank()) {
+                out.add(num + suffix);
+                out.add(num + "/" + suffix);
+                out.add(num + " " + suffix);
+            }
+            out.add(num);
+        }
+        return List.copyOf(out);
+    }
+
+    /**
+     * Prova a parsare la query come indirizzo strutturato.
+     * Riconosce prefissi via/viale/piazza/largo/corso/vicolo/lungotevere/circonvallazione e civico finale.
+     */
+    static ParsedAddress parseAddress(String query) {
+        if (query == null) return null;
+        String q = query.trim().replaceAll("[,;]+", " ").replaceAll("\\s+", " ");
+        if (q.isBlank()) return null;
+
+        String expanded = q
+                .replace('’', '\'')
+                .replaceAll("(?i)\\bp\\.zza\\b", "piazza")
+                .replaceAll("(?i)\\bp\\.za\\b", "piazza")
+                .replaceAll("(?i)\\bv\\.le\\b", "viale")
+                .replaceAll("(?i)\\bl\\.go\\b", "largo")
+                .replaceAll("(?i)\\bc\\.so\\b", "corso")
+                .replaceAll("(?i)\\bv\\.\\b", "via");
+
+        // Civico: numero opzionalmente seguito da /lettera, lettera, "bis"/"ter".
+        java.util.regex.Pattern housePattern = java.util.regex.Pattern.compile(
+                "(?i)\\s+(\\d+\\s*(?:[\\-/]\\s*[a-z]{1,4}|\\s?[a-z]{1,4}|bis|ter|quater)?)\\s*$");
+        java.util.regex.Matcher hm = housePattern.matcher(expanded);
+        String house = null;
+        String streetPart = expanded;
+        if (hm.find()) {
+            house = hm.group(1).replaceAll("\\s+", "").toLowerCase(Locale.ROOT);
+            streetPart = expanded.substring(0, hm.start()).trim();
+        }
+
+        // Estrai eventuale "Roma" / nome comune in coda (dopo virgola era già rimosso).
+        String city = null;
+        for (String town : ROME_METRO_TOWNS) {
+            String regex = "(?i)\\b" + java.util.regex.Pattern.quote(town) + "\\b\\s*$";
+            if (streetPart.toLowerCase(Locale.ROOT).matches(".*" + regex)) {
+                city = capitalize(town);
+                streetPart = streetPart.replaceAll(regex, "").trim();
+                break;
+            }
+        }
+        if (city == null) {
+            java.util.regex.Matcher rm = java.util.regex.Pattern.compile("(?i)\\bRoma\\b\\s*$").matcher(streetPart);
+            if (rm.find()) {
+                city = "Roma";
+                streetPart = streetPart.substring(0, rm.start()).trim();
+            }
+        }
+
+        if (streetPart.isBlank()) return null;
+
+        // Considera "indirizzo" solo se inizia con un type-prefix riconosciuto OPPURE se è presente un civico.
+        boolean hasTypePrefix = streetPart.toLowerCase(Locale.ROOT).matches(
+                "^(via|viale|piazza|largo|corso|vicolo|lungotevere|circonvallazione|salita|discesa|borgo|strada)\\b.*");
+        if (!hasTypePrefix && house == null) return null;
+
+        return new ParsedAddress(streetPart, house, city);
+    }
+
+    private static String capitalize(String value) {
+        if (value == null || value.isBlank()) return value;
+        StringBuilder sb = new StringBuilder(value.length());
+        boolean upper = true;
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (Character.isWhitespace(c)) {
+                upper = true;
+                sb.append(c);
+            } else if (upper) {
+                sb.append(Character.toUpperCase(c));
+                upper = false;
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
     }
 
     @SuppressWarnings("unchecked")
@@ -157,7 +368,8 @@ public class GeocodeSearchService {
         String city = firstNonBlank(
                 toStringOrNull(address.get("city")),
                 toStringOrNull(address.get("municipality")),
-                toStringOrNull(address.get("town"))
+                toStringOrNull(address.get("town")),
+                toStringOrNull(address.get("village"))
         );
 
         List<String> parts = new ArrayList<>(4);
@@ -185,14 +397,25 @@ public class GeocodeSearchService {
                     toStringOrNull(address.get("city")),
                     toStringOrNull(address.get("municipality")),
                     toStringOrNull(address.get("town")),
-                    toStringOrNull(address.get("county"))
+                    toStringOrNull(address.get("village"))
             );
             if (city != null) {
-                String c = city.toLowerCase();
+                String c = city.toLowerCase(Locale.ROOT);
                 if (c.contains("roma")) return true;
+                if (ROME_METRO_TOWNS.contains(c)) return true;
             }
+            String county = toStringOrNull(address.get("county"));
+            if (county != null && county.toLowerCase(Locale.ROOT).contains("roma")) return true;
+            String state = toStringOrNull(address.get("state"));
+            // Ultimo paracadute: provincia/regione lazio + bounding box → consideralo valido.
+            if (state != null && state.toLowerCase(Locale.ROOT).contains("lazio")) return true;
         }
-        return label.toLowerCase().contains("roma");
+        String l = label.toLowerCase(Locale.ROOT);
+        if (l.contains("roma")) return true;
+        for (String town : ROME_METRO_TOWNS) {
+            if (l.contains(town)) return true;
+        }
+        return false;
     }
 
     private static boolean isInsideRomeBounds(double lat, double lon) {
@@ -235,11 +458,15 @@ public class GeocodeSearchService {
         if (qHouseNorm != null) {
             if (houseNorm != null && houseNorm.equals(qHouseNorm)) {
                 score -= 500;
+            } else if (houseNorm != null && houseNumberLooseMatch(qHouseNorm, houseNorm)) {
+                // Match con varianti tipografiche ("3n" vs "3/n" vs "3 n").
+                score -= 380;
             } else if (houseNorm != null && qHouseNorm.startsWith(houseNorm)) {
                 score -= 120;
             } else {
-                // Query contiene civico ma il risultato non lo ha: penalizza molto.
-                score += 260;
+                // Query contiene civico ma il risultato non lo ha: penalità contenuta
+                // così la strada giusta resta visibile come fallback.
+                score += 90;
             }
         }
 
@@ -277,6 +504,17 @@ public class GeocodeSearchService {
             }
         }
         return score;
+    }
+
+    /**
+     * True se i due civici normalizzati corrispondono a meno di separatori/spazi/slash.
+     * Es. "3n" ~ "3/n" ~ "3 n".
+     */
+    private static boolean houseNumberLooseMatch(String a, String b) {
+        if (a == null || b == null) return false;
+        String aa = a.replaceAll("[\\s/\\-]", "");
+        String bb = b.replaceAll("[\\s/\\-]", "");
+        return !aa.isBlank() && aa.equalsIgnoreCase(bb);
     }
 
     private static List<String> queryVariants(String query) {
@@ -337,8 +575,9 @@ public class GeocodeSearchService {
         if (query == null) return null;
         String[] parts = query.trim().split("\\s+");
         for (int i = parts.length - 1; i >= 0; i--) {
+            // Tollerante a separatori "/" e "-": "3/n", "3-n", "3n", "12bis".
             String p = parts[i].replaceAll("[,.;]", "");
-            if (p.matches("(?i)\\d+[a-z]{0,3}")) {
+            if (p.matches("(?i)\\d+([\\-/]?[a-z]{1,4}|bis|ter|quater)?")) {
                 return p;
             }
         }
@@ -424,7 +663,7 @@ public class GeocodeSearchService {
 
     private static String stripStreetTypePrefix(String value) {
         String normalized = normalizeKey(value);
-        return normalized.replaceFirst("^(via|viale|piazza|largo|corso|vicolo|lungotevere|circonvallazione)\\s+", "").trim();
+        return normalized.replaceFirst("^(via|viale|piazza|largo|corso|vicolo|lungotevere|circonvallazione|salita|discesa|borgo|strada)\\s+", "").trim();
     }
 
     private static String denormalizeForQuery(String value) {
@@ -493,4 +732,5 @@ public class GeocodeSearchService {
     private record RankedResult(GeocodeSearchResultDTO result, int score) {}
     private record TimedValue<T>(T value, long loadedAtMillis) {}
     private record VariantFetch(List<Map<String, Object>> rows, boolean rateLimited) {}
+    record ParsedAddress(String street, String houseNumber, String city) {}
 }
