@@ -55,12 +55,20 @@ public class GeocodeSearchService {
         try {
             Map<String, RankedResult> dedup = new LinkedHashMap<>();
             boolean rateLimited = false;
+            int variantIndex = 0;
+
+            // 0) Photon (komoot): autocomplete prefix-based, ottimo per POI, stazioni e
+            //    nomi parziali (es. "Via dei Grac" → "Via dei Gracchi"). Lo interroghiamo
+            //    per primo così le sue feature partono col variantIndex più basso (preferite a
+            //    parità di score). Gli errori di Photon non bloccano la pipeline Nominatim.
+            VariantFetch photonResult = fetchPhoton(q, upstreamLimit, biasLat, biasLon);
+            rateLimited = collectResults(photonResult, dedup, q, biasLat, biasLon, variantIndex);
+            variantIndex++;
 
             // 1) Tentativo prioritario: structured search (street/city) per indirizzi.
             //    Nominatim risolve molto meglio civici italiani con i parametri tipizzati.
             ParsedAddress parsed = parseAddress(q);
-            int variantIndex = 0;
-            if (parsed != null && parsed.street() != null) {
+            if (!rateLimited && parsed != null && parsed.street() != null) {
                 List<ParsedAddress> structuredVariants = expandStructuredVariants(parsed);
                 for (ParsedAddress variant : structuredVariants) {
                     VariantFetch payloadResult = fetchNominatimStructured(variant, upstreamLimit, true);
@@ -185,6 +193,186 @@ public class GeocodeSearchService {
                 .queryParam("viewbox", "%s,%s,%s,%s".formatted(ROME_MIN_LON, ROME_MAX_LAT, ROME_MAX_LON, ROME_MIN_LAT))
                 .queryParam("bounded", bounded ? 1 : 0)
                 .build(), "street=" + streetParam + "&city=" + cityParam);
+    }
+
+    /**
+     * Photon (komoot) free-text search. Punti forti rispetto a Nominatim:
+     *   - prefix/autocomplete: "Via dei Grac" trova "Via dei Gracchi";
+     *   - POI/stazioni: "Stazione Lepanto" intercetta la fermata metro "Lepanto";
+     *   - tokenizzazione più "italiana" sui nomi composti.
+     *
+     * Le feature GeoJSON vengono adattate alla stessa shape Nominatim così tutto il
+     * resto della pipeline (compactLabel, looksLikeRomeResult, rankResult, dedup) funziona
+     * senza modifiche.
+     */
+    @SuppressWarnings("unchecked")
+    private VariantFetch fetchPhoton(String query, int upstreamLimit, Double biasLat, Double biasLon) {
+        // Photon "lang" supporta solo default/de/en/fr (non it). Lasciamo il default.
+        // Appendiamo "Roma" se mancante: empiricamente migliora drasticamente i match per POI
+        // come "Stazione Lepanto" (con bbox stretto, la query nuda torna 0 risultati).
+        String photonQuery = query;
+        if (!photonQuery.toLowerCase(Locale.ROOT).contains("roma")) {
+            photonQuery = photonQuery + " Roma";
+        }
+        final String finalQuery = photonQuery;
+        String cacheKey = "ph|" + normalizeKey(finalQuery) + "|" + upstreamLimit
+                + "|" + bucketBias(biasLat) + "|" + bucketBias(biasLon);
+        try {
+            Map<String, Object> payload = webClient.get()
+                    .uri(uriBuilder -> {
+                        UriBuilder b = uriBuilder
+                                .scheme("https")
+                                .host("photon.komoot.io")
+                                .path("/api/")
+                                .queryParam("q", finalQuery)
+                                .queryParam("limit", upstreamLimit)
+                                // bbox di Photon: minLon,minLat,maxLon,maxLat (diverso dal viewbox Nominatim).
+                                .queryParam("bbox", "%s,%s,%s,%s".formatted(
+                                        ROME_MIN_LON, ROME_MIN_LAT, ROME_MAX_LON, ROME_MAX_LAT));
+                        if (biasLat != null && biasLon != null) {
+                            b = b.queryParam("lat", biasLat).queryParam("lon", biasLon);
+                        }
+                        return b.build();
+                    })
+                    .header("User-Agent", "gtfs-monitor/1.0 (geocode-search)")
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block(Duration.ofSeconds(6));
+            List<Map<String, Object>> rows = photonFeaturesToRows((Map<String, Object>) payload);
+            List<Map<String, Object>> safeRows = List.copyOf(rows);
+            upstreamCache.put(cacheKey, new TimedValue<>(safeRows, System.currentTimeMillis()));
+            return new VariantFetch(safeRows, false);
+        } catch (WebClientResponseException.TooManyRequests e) {
+            List<Map<String, Object>> stale = getCached(upstreamCache, cacheKey, Long.MAX_VALUE);
+            if (stale != null) {
+                log.warn("[GeocodeSearch][Photon] 429 for '{}', using stale cache ({} result(s))",
+                        query, stale.size());
+                return new VariantFetch(stale, true);
+            }
+            log.warn("[GeocodeSearch][Photon] 429 for '{}', no cached fallback", query);
+            return new VariantFetch(List.of(), true);
+        } catch (Exception e) {
+            // Photon è un servizio terzo: in caso di errore non blocchiamo la pipeline,
+            // proseguiamo con Nominatim e usiamo eventualmente la cache stale di Photon.
+            log.warn("[GeocodeSearch][Photon] failed for '{}': {}", query, e.toString());
+            List<Map<String, Object>> stale = getCached(upstreamCache, cacheKey, Long.MAX_VALUE);
+            if (stale != null) {
+                return new VariantFetch(stale, false);
+            }
+            return new VariantFetch(List.of(), false);
+        }
+    }
+
+    /**
+     * Trasforma la GeoJSON FeatureCollection di Photon in righe nello stesso formato
+     * che il resto della pipeline (Nominatim-style) usa già.
+     */
+    @SuppressWarnings("unchecked")
+    private static List<Map<String, Object>> photonFeaturesToRows(Map<String, Object> photonResponse) {
+        if (photonResponse == null) return List.of();
+        Object featuresObj = photonResponse.get("features");
+        if (!(featuresObj instanceof List<?> rawFeatures)) return List.of();
+        List<Map<String, Object>> rows = new ArrayList<>(rawFeatures.size());
+        for (Object feat : rawFeatures) {
+            if (!(feat instanceof Map<?, ?> rawFeat)) continue;
+            Map<String, Object> row = photonFeatureToRow((Map<String, Object>) rawFeat);
+            if (row != null) rows.add(row);
+        }
+        return rows;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> photonFeatureToRow(Map<String, Object> feature) {
+        Object geomObj = feature.get("geometry");
+        Object propsObj = feature.get("properties");
+        if (!(geomObj instanceof Map<?, ?> rawGeom)) return null;
+        if (!(propsObj instanceof Map<?, ?> rawProps)) return null;
+        Map<String, Object> geom = (Map<String, Object>) rawGeom;
+        Map<String, Object> props = (Map<String, Object>) rawProps;
+
+        Object coordsObj = geom.get("coordinates");
+        if (!(coordsObj instanceof List<?> coords) || coords.size() < 2) return null;
+        Double lon = parseDouble(coords.get(0));
+        Double lat = parseDouble(coords.get(1));
+        if (lat == null || lon == null) return null;
+
+        String type = toStringOrNull(props.get("type"));   // house/street/locality/district/city/...
+        String name = toStringOrNull(props.get("name"));
+        String street = toStringOrNull(props.get("street"));
+        String housenumber = toStringOrNull(props.get("housenumber"));
+        String city = firstNonBlank(
+                toStringOrNull(props.get("city")),
+                toStringOrNull(props.get("town")),
+                toStringOrNull(props.get("village")),
+                toStringOrNull(props.get("locality"))
+        );
+        String district = firstNonBlank(
+                toStringOrNull(props.get("district")),
+                toStringOrNull(props.get("suburb")),
+                toStringOrNull(props.get("neighbourhood"))
+        );
+        String state = toStringOrNull(props.get("state"));
+        String country = toStringOrNull(props.get("country"));
+        String postcode = toStringOrNull(props.get("postcode"));
+        String osmKey = toStringOrNull(props.get("osm_key"));
+        String osmValue = toStringOrNull(props.get("osm_value"));
+
+        // Per "house" la strada sta in "street"; per "street" sta in "name". Per POI
+        // di solito non c'è strada associata (solo nome).
+        String road;
+        if (street != null && !street.isBlank()) {
+            road = street;
+        } else if ("street".equalsIgnoreCase(type)) {
+            road = name;
+        } else {
+            road = null;
+        }
+
+        Map<String, Object> address = new LinkedHashMap<>();
+        if (road != null) address.put("road", road);
+        if (housenumber != null) address.put("house_number", housenumber);
+        if (district != null) address.put("suburb", district);
+        if (city != null) address.put("city", city);
+        if (postcode != null) address.put("postcode", postcode);
+        if (state != null) address.put("state", state);
+        if (country != null) address.put("country", country);
+
+        // display_name: ricostruito leggibile, in stile italiano.
+        List<String> parts = new ArrayList<>(5);
+        if ("house".equalsIgnoreCase(type)) {
+            if (road != null) parts.add(housenumber != null ? road + " " + housenumber : road);
+        } else if ("street".equalsIgnoreCase(type)) {
+            if (name != null) parts.add(name);
+        } else {
+            // POI/locality/city: il nome viene per primo, eventuale strada come dettaglio.
+            if (name != null) parts.add(name);
+            if (road != null && !equalsIgnoreCase(road, name)) {
+                parts.add(housenumber != null ? road + " " + housenumber : road);
+            }
+        }
+        if (district != null && !equalsIgnoreCase(district, city) && !equalsIgnoreCase(district, name)) {
+            parts.add(district);
+        }
+        if (city != null && !equalsIgnoreCase(city, name)) parts.add(city);
+        if (state != null && !equalsIgnoreCase(state, city)) parts.add(state);
+        if (country != null) parts.add(country);
+        String displayName = parts.isEmpty() ? (name != null ? name : "") : String.join(", ", parts);
+        if (displayName.isBlank()) return null;
+
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("lat", lat);
+        row.put("lon", lon);
+        row.put("display_name", displayName);
+        row.put("address", address);
+        if (name != null) {
+            row.put("name", name);
+            Map<String, Object> namedetails = new LinkedHashMap<>();
+            namedetails.put("name", name);
+            row.put("namedetails", namedetails);
+        }
+        if (osmKey != null) row.put("class", osmKey);
+        if (osmValue != null) row.put("photon_value", osmValue);
+        return row;
     }
 
     @SuppressWarnings("unchecked")
@@ -536,6 +724,23 @@ public class GeocodeSearchService {
                 .replaceAll("(?i)\\bc\\.so\\b", "corso")
                 .replaceAll("(?i)\\bstaz\\.ne\\b", "stazione");
         variants.add(expanded);
+
+        // POI prefix stripping: "Stazione Lepanto" → tenta anche "Lepanto" e "Lepanto Roma".
+        // In OSM la fermata è spesso taggata col solo nome ("Lepanto"), non col prefisso "Stazione".
+        String expandedLower = expanded.toLowerCase(Locale.ROOT);
+        String[] poiPrefixes = {"stazione ", "fermata ", "metro ", "scalo ", "capolinea "};
+        for (String prefix : poiPrefixes) {
+            if (expandedLower.startsWith(prefix)) {
+                String bare = expanded.substring(prefix.length()).trim();
+                if (!bare.isBlank()) {
+                    variants.add(bare);
+                    if (!bare.toLowerCase(Locale.ROOT).contains("roma")) {
+                        variants.add(bare + " Roma");
+                    }
+                }
+                break;
+            }
+        }
 
         String baseToken = normalizeKey(expanded);
         if (baseToken.equals("carrefour")) {
