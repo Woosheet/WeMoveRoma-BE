@@ -9,6 +9,18 @@ public record JourneyOptionDTO(
         Integer transfers,
         String startTime,
         String endTime,
-        List<JourneyLegDTO> legs
+        List<JourneyLegDTO> legs,
+        List<String> alternativeBoardingTimes
 ) {
+    public JourneyOptionDTO(
+            Integer durationMinutes,
+            Integer walkMinutes,
+            Integer waitingMinutes,
+            Integer transfers,
+            String startTime,
+            String endTime,
+            List<JourneyLegDTO> legs
+    ) {
+        this(durationMinutes, walkMinutes, waitingMinutes, transfers, startTime, endTime, legs, null);
+    }
 }

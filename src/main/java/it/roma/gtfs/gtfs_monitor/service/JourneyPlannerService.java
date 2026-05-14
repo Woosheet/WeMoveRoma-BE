@@ -26,13 +26,13 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.stream.Collectors;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class JourneyPlannerService {
-    private static final int MAX_OTP_OPTIONS = 12;
     private static final Set<String> SUPPORTED_TRANSIT_MODES = Set.of("BUS", "SUBWAY", "TRAM", "RAIL");
     private static final String OTP_GTFS_GRAPHQL_QUERY_TEMPLATE = """
             {
@@ -40,8 +40,27 @@ public class JourneyPlannerService {
                 origin: { label: "%s", location: { coordinate: { latitude: %s, longitude: %s } } }
                 destination: { label: "%s", location: { coordinate: { latitude: %s, longitude: %s } } }
                 dateTime: { %s: "%s" }
-                searchWindow: "PT60M"
+                searchWindow: "%s"
                 %s
+                preferences: {
+                  street: {
+                    walk: {
+                      speed: %s
+                      reluctance: %s
+                      safetyFactor: 1.0
+                      boardCost: 600
+                    }
+                  }
+                  transit: {
+                    transfer: {
+                      cost: %d
+                      slack: "PT%dS"
+                    }
+                    board: { slack: "PT%dS" }
+                    alight: { slack: "PT%dS" }
+                    waitReluctance: %s
+                  }
+                }
                 first: %d
               ) {
                 edges {
@@ -93,7 +112,42 @@ public class JourneyPlannerService {
     @Value("${journey.otp.plan-path:/otp/routers/default/plan}")
     private String otpPlanPath;
 
-    @SuppressWarnings("unchecked")
+    @Value("${journey.otp.timeout-seconds:15}")
+    private long otpTimeoutSeconds;
+
+    @Value("${journey.otp.search-window:PT60M}")
+    private String searchWindow;
+
+    @Value("${journey.otp.search-window-fallback:PT120M}")
+    private String searchWindowFallback;
+
+    @Value("${journey.otp.max-itineraries:10}")
+    private int maxItineraries;
+
+    @Value("${journey.otp.max-upstream-itineraries:20}")
+    private int maxUpstreamItineraries;
+
+    @Value("${journey.otp.walk-speed:1.34}")
+    private double walkSpeed;
+
+    @Value("${journey.otp.walk-reluctance:1.6}")
+    private double walkReluctance;
+
+    @Value("${journey.otp.wait-reluctance:1.0}")
+    private double waitReluctance;
+
+    @Value("${journey.otp.transfer-penalty:300}")
+    private int transferPenalty;
+
+    @Value("${journey.otp.board-slack-seconds:60}")
+    private int boardSlackSeconds;
+
+    @Value("${journey.otp.alight-slack-seconds:30}")
+    private int alightSlackSeconds;
+
+    @Value("${journey.otp.stairs-reluctance:1.8}")
+    private double stairsReluctance;
+
     public JourneyPlanResponseDTO plan(
             double fromLat,
             double fromLon,
@@ -108,8 +162,10 @@ public class JourneyPlannerService {
     ) {
         JourneyLocationDTO from = new JourneyLocationDTO(fromLat, fromLon, fromLabel);
         JourneyLocationDTO to = new JourneyLocationDTO(toLat, toLon, toLabel);
-        int limit = numItineraries == null || numItineraries <= 0 ? 5 : Math.min(numItineraries, 6);
-        int upstreamLimit = Math.min(Math.max(limit * 3, limit + 2), MAX_OTP_OPTIONS);
+
+        int hardCap = Math.max(2, maxItineraries);
+        int requested = numItineraries == null || numItineraries <= 0 ? 5 : Math.min(numItineraries, hardCap);
+        int upstreamLimit = Math.min(Math.max(requested * 3, requested + 4), Math.max(hardCap * 2, maxUpstreamItineraries));
 
         if (!otpEnabled) {
             return new JourneyPlanResponseDTO(
@@ -122,11 +178,56 @@ public class JourneyPlannerService {
             );
         }
 
+        Instant now = Instant.now();
+        TimePreference preference = resolveTimePreference(timeMode, when, now);
+        String modesClause = buildModesClause(modes);
+
+        List<JourneyOptionDTO> rawOptions = executeQuery(
+                fromLat, fromLon, fromLabel,
+                toLat, toLon, toLabel,
+                preference, modesClause, upstreamLimit, searchWindow
+        );
+
+        // Fallback con searchWindow allargata se la prima ricerca è vuota
+        boolean fallbackUsed = false;
+        if (rawOptions.isEmpty() && !searchWindow.equals(searchWindowFallback)) {
+            log.info("[JourneyPlanner] Empty result with searchWindow={}, retry with {}",
+                    searchWindow, searchWindowFallback);
+            rawOptions = executeQuery(
+                    fromLat, fromLon, fromLabel,
+                    toLat, toLon, toLabel,
+                    preference, modesClause, upstreamLimit, searchWindowFallback
+            );
+            fallbackUsed = !rawOptions.isEmpty();
+        }
+
+        if (rawOptions == null) {
+            return new JourneyPlanResponseDTO(
+                    "otp", from, to, List.of(),
+                    "Trip planner non raggiungibile. Verifica server OTP.",
+                    Instant.now()
+            );
+        }
+
+        List<JourneyOptionDTO> options = dedupeAndEnrich(rawOptions, requested);
+        String error = options.isEmpty() ? "Nessun percorso trovato." : null;
+        if (fallbackUsed && !options.isEmpty()) {
+            log.debug("[JourneyPlanner] Returning {} itineraries via fallback window", options.size());
+        }
+        return new JourneyPlanResponseDTO("otp", from, to, options, error, now);
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<JourneyOptionDTO> executeQuery(
+            double fromLat, double fromLon, String fromLabel,
+            double toLat, double toLon, String toLabel,
+            TimePreference preference,
+            String modesClause,
+            int upstreamLimit,
+            String windowIso
+    ) {
         try {
             URI uri = resolveOtpGraphQlUri();
-            Instant now = Instant.now();
-            TimePreference preference = resolveTimePreference(timeMode, when, now);
-            String modesClause = buildModesClause(modes);
             String query = OTP_GTFS_GRAPHQL_QUERY_TEMPLATE.formatted(
                     escapeGraphqlString(firstNonBlank(fromLabel, "Partenza")),
                     trimDecimals(fromLat),
@@ -136,7 +237,15 @@ public class JourneyPlannerService {
                     trimDecimals(toLon),
                     preference.graphQlField(),
                     preference.when().toString(),
+                    windowIso,
                     modesClause,
+                    formatNumber(walkSpeed),
+                    formatNumber(walkReluctance),
+                    transferPenalty,
+                    0,
+                    boardSlackSeconds,
+                    alightSlackSeconds,
+                    formatNumber(waitReluctance),
                     upstreamLimit
             );
 
@@ -150,15 +259,21 @@ public class JourneyPlannerService {
                     .bodyValue(request)
                     .retrieve()
                     .bodyToMono(Map.class)
-                    .block(Duration.ofSeconds(15));
+                    .block(Duration.ofSeconds(Math.max(1, otpTimeoutSeconds)));
 
             if (payload == null) {
-                return new JourneyPlanResponseDTO("otp", from, to, List.of(), "Risposta vuota da OTP.", now);
+                return List.of();
             }
-
             if (payload.get("errors") instanceof List<?> errors && !errors.isEmpty()) {
-                String msg = extractGraphqlErrors((List<?>) errors);
-                return new JourneyPlanResponseDTO("otp", from, to, List.of(), msg, now);
+                log.warn("[JourneyPlanner] OTP GraphQL errors: {}", extractGraphqlErrors(errors));
+                // Retry una volta senza il blocco preferences (alcune versioni di OTP differiscono nello schema)
+                if (containsPreferencesSchemaError(errors)) {
+                    return executeFallbackQueryWithoutPreferences(
+                            fromLat, fromLon, fromLabel, toLat, toLon, toLabel,
+                            preference, modesClause, upstreamLimit, windowIso
+                    );
+                }
+                return List.of();
             }
 
             Map<String, Object> data = payload.get("data") instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
@@ -167,28 +282,123 @@ public class JourneyPlannerService {
             List<Map<String, Object>> edges = planConnection.get("edges") instanceof List<?> l
                     ? (List<Map<String, Object>>) (List<?>) l : List.of();
 
-            List<JourneyOptionDTO> rawOptions = edges.stream()
+            return edges.stream()
                     .map(edge -> edge.get("node"))
                     .filter(Map.class::isInstance)
                     .map(node -> toJourneyOption((Map<String, Object>) node))
                     .filter(o -> o.legs() != null && !o.legs().isEmpty())
                     .toList();
-            List<JourneyOptionDTO> options = dedupeJourneyOptions(rawOptions, limit);
-
-            String error = options.isEmpty() ? "Nessun percorso trovato." : null;
-            return new JourneyPlanResponseDTO("otp", from, to, options, error, now);
         } catch (Exception e) {
-            log.warn("[JourneyPlanner] OTP GraphQL request failed for {} -> {} with modes={}: {}",
-                    fromLabel,
-                    toLabel,
-                    modes,
-                    e.toString(),
-                    e);
-            return new JourneyPlanResponseDTO(
-                    "otp", from, to, List.of(),
-                    "Trip planner non raggiungibile. Verifica server OTP.",
-                    Instant.now()
+            log.warn("[JourneyPlanner] OTP GraphQL request failed for {} -> {} (window={}): {}",
+                    fromLabel, toLabel, windowIso, e.toString(), e);
+            return null;
+        }
+    }
+
+    private static boolean containsPreferencesSchemaError(List<?> errors) {
+        for (Object err : errors) {
+            if (err instanceof Map<?, ?> m) {
+                String msg = toStringOrNull(m.get("message"));
+                if (msg == null) continue;
+                String lower = msg.toLowerCase(Locale.ROOT);
+                if (lower.contains("preferences") || lower.contains("walkreluctance")
+                        || lower.contains("transferpenalty") || lower.contains("waitreluctance")
+                        || lower.contains("unknown argument") || lower.contains("unknown field")
+                        || lower.contains("unknown type")
+                        || lower.contains("expected type")
+                        || lower.contains("coercingparsevalueexception")
+                        || lower.contains("validationerror")
+                        || lower.contains("wrongtype")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<JourneyOptionDTO> executeFallbackQueryWithoutPreferences(
+            double fromLat, double fromLon, String fromLabel,
+            double toLat, double toLon, String toLabel,
+            TimePreference preference,
+            String modesClause,
+            int upstreamLimit,
+            String windowIso
+    ) {
+        try {
+            URI uri = resolveOtpGraphQlUri();
+            String query = """
+                    {
+                      planConnection(
+                        origin: { label: "%s", location: { coordinate: { latitude: %s, longitude: %s } } }
+                        destination: { label: "%s", location: { coordinate: { latitude: %s, longitude: %s } } }
+                        dateTime: { %s: "%s" }
+                        searchWindow: "%s"
+                        %s
+                        first: %d
+                      ) {
+                        edges {
+                          node {
+                            start
+                            end
+                            duration
+                            legs {
+                              mode
+                              transitLeg
+                              realTime
+                              headsign
+                              from { name lat lon }
+                              to { name lat lon }
+                              route { gtfsId shortName longName agency { gtfsId name } }
+                              trip { gtfsId tripShortName }
+                              legGeometry { points }
+                              stopCalls { stopLocation { ... on Stop { name lat lon } } }
+                              start { estimated { time } }
+                              end { estimated { time } }
+                              duration
+                            }
+                          }
+                        }
+                      }
+                    }
+                    """.formatted(
+                    escapeGraphqlString(firstNonBlank(fromLabel, "Partenza")),
+                    trimDecimals(fromLat),
+                    trimDecimals(fromLon),
+                    escapeGraphqlString(firstNonBlank(toLabel, "Destinazione")),
+                    trimDecimals(toLat),
+                    trimDecimals(toLon),
+                    preference.graphQlField(),
+                    preference.when().toString(),
+                    windowIso,
+                    modesClause,
+                    upstreamLimit
             );
+            Map<String, Object> request = new LinkedHashMap<>();
+            request.put("query", query);
+            Map<String, Object> payload = webClient.post()
+                    .uri(uri)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .header("User-Agent", "gtfs-monitor/1.0 (journey-planner)")
+                    .bodyValue(request)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block(Duration.ofSeconds(Math.max(1, otpTimeoutSeconds)));
+            if (payload == null) return List.of();
+            Map<String, Object> data = payload.get("data") instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
+            Map<String, Object> planConnection = data.get("planConnection") instanceof Map<?, ?> m
+                    ? (Map<String, Object>) m : Map.of();
+            List<Map<String, Object>> edges = planConnection.get("edges") instanceof List<?> l
+                    ? (List<Map<String, Object>>) (List<?>) l : List.of();
+            return edges.stream()
+                    .map(edge -> edge.get("node"))
+                    .filter(Map.class::isInstance)
+                    .map(node -> toJourneyOption((Map<String, Object>) node))
+                    .filter(o -> o.legs() != null && !o.legs().isEmpty())
+                    .toList();
+        } catch (Exception e) {
+            log.warn("[JourneyPlanner] OTP fallback (no preferences) failed: {}", e.toString());
+            return List.of();
         }
     }
 
@@ -233,6 +443,11 @@ public class JourneyPlannerService {
         int walkMinutes = 0;
         int transfers = 0;
         int transitLegs = 0;
+
+        // Per il calcolo del waitingMinutes: somma dei gap tra fine di una leg e inizio della successiva
+        // (l'attesa effettiva alle fermate di interscambio o all'origine se OTP la include).
+        int waitingMinutes = 0;
+        String previousLegEnd = null;
 
         for (Map<String, Object> leg : legsRaw) {
             String mode = toStringOrNull(leg.get("mode"));
@@ -305,6 +520,16 @@ public class JourneyPlannerService {
                 walkMinutes += Math.max(0, legDuration);
             }
 
+            if (previousLegEnd != null && legStart != null) {
+                Integer gap = diffMinutes(previousLegEnd, legStart);
+                if (gap != null && gap > 0) {
+                    waitingMinutes += gap;
+                }
+            }
+            if (legEnd != null) {
+                previousLegEnd = legEnd;
+            }
+
             Integer realtimeDelay = null;
             String geometryPoints = null;
             if (leg.get("legGeometry") instanceof Map<?, ?> geometry) {
@@ -342,14 +567,18 @@ public class JourneyPlannerService {
             transfers = transitLegs - 1;
         }
 
+        Integer durationFinal = durationMin != null ? durationMin : diffMinutes(startTime, endTime);
+        Integer waitingFinal = transfers > 0 && waitingMinutes > 0 ? waitingMinutes : null;
+
         return new JourneyOptionDTO(
-                durationMin != null ? durationMin : diffMinutes(startTime, endTime),
+                durationFinal,
                 walkMinutes > 0 ? walkMinutes : null,
-                null,
+                waitingFinal,
                 transfers,
                 startTime,
                 endTime,
-                legs
+                legs,
+                null
         );
     }
 
@@ -425,7 +654,7 @@ public class JourneyPlannerService {
         }
     }
 
-    private static List<JourneyOptionDTO> dedupeJourneyOptions(List<JourneyOptionDTO> rawOptions, int limit) {
+    private List<JourneyOptionDTO> dedupeAndEnrich(List<JourneyOptionDTO> rawOptions, int limit) {
         if (rawOptions.isEmpty()) {
             return List.of();
         }
@@ -435,16 +664,34 @@ public class JourneyPlannerService {
                         .thenComparingInt(option -> option.durationMinutes() != null ? option.durationMinutes() : Integer.MAX_VALUE)
                         .thenComparingInt(option -> option.transfers() != null ? option.transfers() : Integer.MAX_VALUE)
                         .thenComparingInt(option -> option.walkMinutes() != null ? option.walkMinutes() : Integer.MAX_VALUE)
+                        .thenComparingInt(JourneyPlannerService::realtimeBonus)
                         .thenComparingInt(JourneyPlannerService::journeyTransitPreferenceScore))
                 .toList();
 
-        Set<String> seen = new LinkedHashSet<>();
-        List<JourneyOptionDTO> unique = new ArrayList<>();
+        Map<String, List<JourneyOptionDTO>> grouped = new LinkedHashMap<>();
         for (JourneyOptionDTO option : ordered) {
-            if (!seen.add(journeyOptionSignature(option))) {
-                continue;
+            String key = patternSignature(option);
+            grouped.computeIfAbsent(key, k -> new ArrayList<>()).add(option);
+        }
+
+        List<JourneyOptionDTO> unique = new ArrayList<>();
+        for (Map.Entry<String, List<JourneyOptionDTO>> entry : grouped.entrySet()) {
+            List<JourneyOptionDTO> bucket = entry.getValue();
+            JourneyOptionDTO primary = bucket.get(0);
+            List<String> alternativeBoardings = collectAlternativeBoardings(bucket);
+            if (!alternativeBoardings.isEmpty() || primary.alternativeBoardingTimes() == null) {
+                primary = new JourneyOptionDTO(
+                        primary.durationMinutes(),
+                        primary.walkMinutes(),
+                        primary.waitingMinutes(),
+                        primary.transfers(),
+                        primary.startTime(),
+                        primary.endTime(),
+                        primary.legs(),
+                        alternativeBoardings.isEmpty() ? null : alternativeBoardings
+                );
             }
-            unique.add(option);
+            unique.add(primary);
             if (unique.size() >= limit) {
                 break;
             }
@@ -452,16 +699,14 @@ public class JourneyPlannerService {
         return unique;
     }
 
-    private static String journeyOptionSignature(JourneyOptionDTO option) {
+    /**
+     * Firma "pattern" che identifica itinerari sostanzialmente equivalenti
+     * (stessa sequenza di linee/headsign/fermate), indipendentemente dall'orario.
+     * Le alternative degli stessi pattern diventano alternativeBoardingTimes.
+     */
+    private static String patternSignature(JourneyOptionDTO option) {
         StringBuilder out = new StringBuilder();
-        out.append(option.transfers() != null ? option.transfers() : -1)
-                .append('|')
-                .append(option.walkMinutes() != null ? option.walkMinutes() : -1)
-                .append('|')
-                .append(bucketTime(option.startTime()))
-                .append('|')
-                .append(bucketTime(option.endTime()));
-
+        out.append(option.transfers() != null ? option.transfers() : -1);
         for (JourneyLegDTO leg : option.legs()) {
             String mode = firstNonBlank(leg.mode(), "NA");
             out.append("||").append(mode);
@@ -479,23 +724,35 @@ public class JourneyPlannerService {
                     .append('|')
                     .append(normalizeKey(leg.fromName()))
                     .append('|')
-                    .append(normalizeKey(leg.toName()))
-                    .append('|')
-                    .append(bucketTime(leg.startTime()))
-                    .append('|')
-                    .append(bucketTime(leg.endTime()));
+                    .append(normalizeKey(leg.toName()));
         }
         return out.toString();
     }
 
-    private static int bucketTime(String iso) {
-        if (iso == null || iso.isBlank()) return -1;
-        try {
-            long minutes = Instant.parse(iso).getEpochSecond() / 60L;
-            return (int) (minutes / 5L);
-        } catch (Exception e) {
-            return -1;
+    private static List<String> collectAlternativeBoardings(List<JourneyOptionDTO> bucket) {
+        if (bucket.size() <= 1) return List.of();
+        JourneyOptionDTO primary = bucket.get(0);
+        String primaryFirstTransitStart = firstTransitLegStart(primary);
+        TreeSet<String> times = new TreeSet<>();
+        for (int i = 1; i < bucket.size(); i++) {
+            String t = firstTransitLegStart(bucket.get(i));
+            if (t == null) continue;
+            if (t.equals(primaryFirstTransitStart)) continue;
+            times.add(t);
+            if (times.size() >= 5) break;
         }
+        return new ArrayList<>(times);
+    }
+
+    private static String firstTransitLegStart(JourneyOptionDTO option) {
+        if (option.legs() == null) return null;
+        for (JourneyLegDTO leg : option.legs()) {
+            String mode = leg.mode();
+            if (mode != null && !"WALK".equalsIgnoreCase(mode) && leg.startTime() != null) {
+                return leg.startTime();
+            }
+        }
+        return option.startTime();
     }
 
     private static String normalizeKey(String value) {
@@ -506,6 +763,25 @@ public class JourneyPlannerService {
         return option.legs() != null
                 && !option.legs().isEmpty()
                 && option.legs().stream().allMatch(leg -> "WALK".equalsIgnoreCase(leg.mode()));
+    }
+
+    /**
+     * Penalità invertita: itinerari con tutti i transit-leg in realtime ottengono il valore minore.
+     * Usato come tie-breaker nel comparator (lower-is-better).
+     */
+    private static int realtimeBonus(JourneyOptionDTO option) {
+        if (option.legs() == null || option.legs().isEmpty()) return 0;
+        int transit = 0;
+        int rt = 0;
+        for (JourneyLegDTO leg : option.legs()) {
+            if (leg.mode() == null || "WALK".equalsIgnoreCase(leg.mode())) continue;
+            transit++;
+            if (Boolean.TRUE.equals(leg.realtime())) rt++;
+        }
+        if (transit == 0) return 0;
+        if (rt == transit) return -2; // tutti realtime → bonus massimo
+        if (rt > 0) return -1;        // parziale
+        return 0;
     }
 
     private static int journeyTransitPreferenceScore(JourneyOptionDTO option) {
@@ -568,7 +844,11 @@ public class JourneyPlannerService {
     }
 
     private static String trimDecimals(double value) {
-        return String.format(java.util.Locale.ROOT, "%.6f", value);
+        return String.format(Locale.ROOT, "%.6f", value);
+    }
+
+    private static String formatNumber(double value) {
+        return String.format(Locale.ROOT, "%.2f", value);
     }
 
     private static String escapeGraphqlString(String value) {
