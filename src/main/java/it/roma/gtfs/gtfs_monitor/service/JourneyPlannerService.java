@@ -654,6 +654,20 @@ public class JourneyPlannerService {
         }
     }
 
+    /**
+     * Epoch millis dell'orario di arrivo (endTime ISO 8601) usato come criterio
+     * primario di ordinamento. Le opzioni senza arrivo valido finiscono in fondo.
+     */
+    private static long arrivalEpochMillis(JourneyOptionDTO option) {
+        String end = option.endTime();
+        if (end == null || end.isBlank()) return Long.MAX_VALUE;
+        try {
+            return Instant.parse(end).toEpochMilli();
+        } catch (Exception ex) {
+            return Long.MAX_VALUE;
+        }
+    }
+
     private List<JourneyOptionDTO> dedupeAndEnrich(List<JourneyOptionDTO> rawOptions, int limit) {
         if (rawOptions.isEmpty()) {
             return List.of();
@@ -661,6 +675,7 @@ public class JourneyPlannerService {
         List<JourneyOptionDTO> ordered = rawOptions.stream()
                 .sorted(Comparator
                         .comparing((JourneyOptionDTO option) -> isWalkOnly(option))
+                        .thenComparingLong(JourneyPlannerService::arrivalEpochMillis)
                         .thenComparingInt(option -> option.durationMinutes() != null ? option.durationMinutes() : Integer.MAX_VALUE)
                         .thenComparingInt(option -> option.transfers() != null ? option.transfers() : Integer.MAX_VALUE)
                         .thenComparingInt(option -> option.walkMinutes() != null ? option.walkMinutes() : Integer.MAX_VALUE)
