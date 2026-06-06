@@ -148,6 +148,21 @@ public class JourneyPlannerService {
     @Value("${journey.otp.stairs-reluctance:1.8}")
     private double stairsReluctance;
 
+    /**
+     * Posizione (0-based) entro cui garantire la visibilità della migliore opzione treno (RAIL).
+     * Es. 2 = il treno appare al più come terza opzione, senza scalzare la #0 (la più veloce).
+     */
+    @Value("${journey.otp.rail-visibility-slot:2}")
+    private int railVisibilitySlot;
+
+    /**
+     * Quanto può arrivare più tardi (in minuti) la migliore opzione treno rispetto alla
+     * migliore opzione in assoluto per essere comunque promossa tra i risultati visibili.
+     * Oltre questa soglia il treno non viene forzato in alto (sarebbe poco sensato).
+     */
+    @Value("${journey.otp.rail-visibility-max-delay-minutes:45}")
+    private long railVisibilityMaxDelayMinutes;
+
     public JourneyPlanResponseDTO plan(
             double fromLat,
             double fromLon,
@@ -689,6 +704,8 @@ public class JourneyPlannerService {
             grouped.computeIfAbsent(key, k -> new ArrayList<>()).add(option);
         }
 
+        // Deduplica TUTTI i pattern (niente break sul limite): così la migliore opzione treno
+        // non viene scartata prima ancora di essere costruita e resta candidabile alla promozione.
         List<JourneyOptionDTO> unique = new ArrayList<>();
         for (Map.Entry<String, List<JourneyOptionDTO>> entry : grouped.entrySet()) {
             List<JourneyOptionDTO> bucket = entry.getValue();
@@ -707,11 +724,73 @@ public class JourneyPlannerService {
                 );
             }
             unique.add(primary);
-            if (unique.size() >= limit) {
-                break;
+        }
+
+        List<JourneyOptionDTO> result = new ArrayList<>(unique.subList(0, Math.min(limit, unique.size())));
+        promoteBestRailOption(unique, result, limit);
+        return result;
+    }
+
+    /**
+     * Garantisce che la migliore opzione "treno" (leg RAIL) sia visibile tra i primi risultati.
+     * <p>
+     * Il ranking primario è per orario di arrivo, quindi un treno leggermente più lento di un
+     * bus/metro finirebbe in fondo (o oltre il limite) e l'utente lo percepisce come "non suggerito".
+     * Qui, se la migliore opzione treno non è già entro {@code railVisibilitySlot}, la si promuove a
+     * quella posizione — senza toccare la #0 (l'opzione più veloce resta prima) e solo se il treno è
+     * competitivo (arrivo entro {@code railVisibilityMaxDelayMinutes} dalla migliore opzione).
+     */
+    private void promoteBestRailOption(List<JourneyOptionDTO> rankedUnique, List<JourneyOptionDTO> result, int limit) {
+        if (result.isEmpty()) {
+            return;
+        }
+        JourneyOptionDTO bestRail = rankedUnique.stream()
+                .filter(JourneyPlannerService::hasRailLeg)
+                .findFirst()
+                .orElse(null);
+        if (bestRail == null) {
+            return;
+        }
+
+        int slot = Math.min(Math.max(0, railVisibilitySlot), Math.max(0, result.size() - 1));
+        int currentIdx = result.indexOf(bestRail);
+        if (currentIdx >= 0 && currentIdx <= slot) {
+            return; // già visibile in alto, niente da fare
+        }
+
+        long railArrival = arrivalEpochMillis(bestRail);
+        if (railArrival == Long.MAX_VALUE) {
+            return; // senza orario di arrivo valido non forziamo la posizione
+        }
+        long bestArrival = arrivalEpochMillis(result.get(0));
+        if (bestArrival != Long.MAX_VALUE) {
+            long deltaMinutes = (railArrival - bestArrival) / 60_000L;
+            if (deltaMinutes > railVisibilityMaxDelayMinutes) {
+                return; // treno troppo più lento: non sensato spingerlo in alto
             }
         }
-        return unique;
+
+        if (currentIdx >= 0) {
+            result.remove(currentIdx);
+        }
+        int insertAt = Math.min(slot, result.size());
+        result.add(insertAt, bestRail);
+        while (result.size() > limit) {
+            result.remove(result.size() - 1);
+        }
+        log.debug("[JourneyPlanner] Rail option promoted to slot {} for visibility", insertAt);
+    }
+
+    private static boolean hasRailLeg(JourneyOptionDTO option) {
+        if (option.legs() == null) {
+            return false;
+        }
+        for (JourneyLegDTO leg : option.legs()) {
+            if ("RAIL".equalsIgnoreCase(leg.mode())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
