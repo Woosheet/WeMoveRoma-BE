@@ -42,25 +42,6 @@ public class JourneyPlannerService {
                 dateTime: { %s: "%s" }
                 searchWindow: "%s"
                 %s
-                preferences: {
-                  street: {
-                    walk: {
-                      speed: %s
-                      reluctance: %s
-                      safetyFactor: 1.0
-                      boardCost: 600
-                    }
-                  }
-                  transit: {
-                    transfer: {
-                      cost: %d
-                      slack: "PT%dS"
-                    }
-                    board: { slack: "PT%dS" }
-                    alight: { slack: "PT%dS" }
-                    waitReluctance: %s
-                  }
-                }
                 first: %d
               ) {
                 edges {
@@ -163,6 +144,19 @@ public class JourneyPlannerService {
     @Value("${journey.otp.rail-visibility-max-delay-minutes:45}")
     private long railVisibilityMaxDelayMinutes;
 
+    /**
+     * Workaround: quando il piano normale NON contiene alcun treno ma partenza e arrivo sono
+     * entrambi vicini a una stazione ferroviaria, costruisce un'opzione "treno" sintetica
+     * (cammino -> treno stazione->stazione -> cammino), bypassando il caso limite di routing
+     * access/egress di OTP sui salti brevi. Disattivabile mettendo il flag a false.
+     */
+    @Value("${journey.otp.rail-injection-enabled:true}")
+    private boolean railInjectionEnabled;
+
+    /** Raggio massimo (metri) entro cui cercare la stazione ferroviaria di salita/discesa. */
+    @Value("${journey.otp.rail-injection-max-station-meters:1200}")
+    private int railInjectionMaxStationMeters;
+
     public JourneyPlanResponseDTO plan(
             double fromLat,
             double fromLon,
@@ -225,6 +219,23 @@ public class JourneyPlannerService {
         }
 
         List<JourneyOptionDTO> options = dedupeAndEnrich(rawOptions, requested);
+
+        // Workaround iniezione treno: solo se non c'è già un treno tra le opzioni.
+        if (railInjectionEnabled && options.stream().noneMatch(JourneyPlannerService::hasRailLeg)) {
+            JourneyOptionDTO injected = tryBuildInjectedRailOption(
+                    fromLat, fromLon, toLat, toLon, preference);
+            if (injected != null) {
+                List<JourneyOptionDTO> withRail = new ArrayList<>(options);
+                int slot = Math.min(Math.max(0, railVisibilitySlot), withRail.size());
+                withRail.add(slot, injected);
+                while (withRail.size() > requested) {
+                    withRail.remove(withRail.size() - 1);
+                }
+                options = withRail;
+                log.debug("[JourneyPlanner] Injected synthetic rail option at slot {}", slot);
+            }
+        }
+
         String error = options.isEmpty() ? "Nessun percorso trovato." : null;
         if (fallbackUsed && !options.isEmpty()) {
             log.debug("[JourneyPlanner] Returning {} itineraries via fallback window", options.size());
@@ -254,13 +265,6 @@ public class JourneyPlannerService {
                     preference.when().toString(),
                     windowIso,
                     modesClause,
-                    formatNumber(walkSpeed),
-                    formatNumber(walkReluctance),
-                    transferPenalty,
-                    0,
-                    boardSlackSeconds,
-                    alightSlackSeconds,
-                    formatNumber(waitReluctance),
                     upstreamLimit
             );
 
@@ -281,13 +285,6 @@ public class JourneyPlannerService {
             }
             if (payload.get("errors") instanceof List<?> errors && !errors.isEmpty()) {
                 log.warn("[JourneyPlanner] OTP GraphQL errors: {}", extractGraphqlErrors(errors));
-                // Retry una volta senza il blocco preferences (alcune versioni di OTP differiscono nello schema)
-                if (containsPreferencesSchemaError(errors)) {
-                    return executeFallbackQueryWithoutPreferences(
-                            fromLat, fromLon, fromLabel, toLat, toLon, toLabel,
-                            preference, modesClause, upstreamLimit, windowIso
-                    );
-                }
                 return List.of();
             }
 
@@ -307,113 +304,6 @@ public class JourneyPlannerService {
             log.warn("[JourneyPlanner] OTP GraphQL request failed for {} -> {} (window={}): {}",
                     fromLabel, toLabel, windowIso, e.toString(), e);
             return null;
-        }
-    }
-
-    private static boolean containsPreferencesSchemaError(List<?> errors) {
-        for (Object err : errors) {
-            if (err instanceof Map<?, ?> m) {
-                String msg = toStringOrNull(m.get("message"));
-                if (msg == null) continue;
-                String lower = msg.toLowerCase(Locale.ROOT);
-                if (lower.contains("preferences") || lower.contains("walkreluctance")
-                        || lower.contains("transferpenalty") || lower.contains("waitreluctance")
-                        || lower.contains("unknown argument") || lower.contains("unknown field")
-                        || lower.contains("unknown type")
-                        || lower.contains("expected type")
-                        || lower.contains("coercingparsevalueexception")
-                        || lower.contains("validationerror")
-                        || lower.contains("wrongtype")) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    @SuppressWarnings("unchecked")
-    private List<JourneyOptionDTO> executeFallbackQueryWithoutPreferences(
-            double fromLat, double fromLon, String fromLabel,
-            double toLat, double toLon, String toLabel,
-            TimePreference preference,
-            String modesClause,
-            int upstreamLimit,
-            String windowIso
-    ) {
-        try {
-            URI uri = resolveOtpGraphQlUri();
-            String query = """
-                    {
-                      planConnection(
-                        origin: { label: "%s", location: { coordinate: { latitude: %s, longitude: %s } } }
-                        destination: { label: "%s", location: { coordinate: { latitude: %s, longitude: %s } } }
-                        dateTime: { %s: "%s" }
-                        searchWindow: "%s"
-                        %s
-                        first: %d
-                      ) {
-                        edges {
-                          node {
-                            start
-                            end
-                            duration
-                            legs {
-                              mode
-                              transitLeg
-                              realTime
-                              headsign
-                              from { name lat lon }
-                              to { name lat lon }
-                              route { gtfsId shortName longName agency { gtfsId name } }
-                              trip { gtfsId tripShortName }
-                              legGeometry { points }
-                              stopCalls { stopLocation { ... on Stop { name lat lon } } }
-                              start { estimated { time } }
-                              end { estimated { time } }
-                              duration
-                            }
-                          }
-                        }
-                      }
-                    }
-                    """.formatted(
-                    escapeGraphqlString(firstNonBlank(fromLabel, "Partenza")),
-                    trimDecimals(fromLat),
-                    trimDecimals(fromLon),
-                    escapeGraphqlString(firstNonBlank(toLabel, "Destinazione")),
-                    trimDecimals(toLat),
-                    trimDecimals(toLon),
-                    preference.graphQlField(),
-                    preference.when().toString(),
-                    windowIso,
-                    modesClause,
-                    upstreamLimit
-            );
-            Map<String, Object> request = new LinkedHashMap<>();
-            request.put("query", query);
-            Map<String, Object> payload = webClient.post()
-                    .uri(uri)
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .header("User-Agent", "gtfs-monitor/1.0 (journey-planner)")
-                    .bodyValue(request)
-                    .retrieve()
-                    .bodyToMono(Map.class)
-                    .block(Duration.ofSeconds(Math.max(1, otpTimeoutSeconds)));
-            if (payload == null) return List.of();
-            Map<String, Object> data = payload.get("data") instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
-            Map<String, Object> planConnection = data.get("planConnection") instanceof Map<?, ?> m
-                    ? (Map<String, Object>) m : Map.of();
-            List<Map<String, Object>> edges = planConnection.get("edges") instanceof List<?> l
-                    ? (List<Map<String, Object>>) (List<?>) l : List.of();
-            return edges.stream()
-                    .map(edge -> edge.get("node"))
-                    .filter(Map.class::isInstance)
-                    .map(node -> toJourneyOption((Map<String, Object>) node))
-                    .filter(o -> o.legs() != null && !o.legs().isEmpty())
-                    .toList();
-        } catch (Exception e) {
-            log.warn("[JourneyPlanner] OTP fallback (no preferences) failed: {}", e.toString());
-            return List.of();
         }
     }
 
@@ -980,5 +870,274 @@ public class JourneyPlannerService {
     }
 
     private record TimePreference(String graphQlField, Instant when) {
+    }
+
+    // =====================================================================
+    // Workaround iniezione treno (salti brevi tra stazioni vicine)
+    // =====================================================================
+
+    private record RailStation(String name, double lat, double lon) {
+    }
+
+    private JourneyOptionDTO tryBuildInjectedRailOption(
+            double fromLat, double fromLon, double toLat, double toLon, TimePreference preference) {
+        try {
+            RailStation board = nearestRailStation(fromLat, fromLon);
+            RailStation alight = nearestRailStation(toLat, toLon);
+            if (board == null || alight == null) {
+                return null;
+            }
+            if (board.name().trim().equalsIgnoreCase(alight.name().trim())) {
+                return null; // stessa stazione: niente da iniettare
+            }
+
+            int accessMin = walkMinutesBetween(fromLat, fromLon, board.lat(), board.lon());
+            int egressMin = walkMinutesBetween(alight.lat(), alight.lon(), toLat, toLon);
+
+            List<JourneyLegDTO> railLegs = railLegsBetween(board, alight, preference);
+            if (railLegs.isEmpty()) {
+                return null;
+            }
+
+            // Scegli il primo treno che si fa davvero in tempo a prendere: deve partire dopo
+            // l'orario richiesto + il tempo di cammino fino alla stazione di salita.
+            Instant earliestCatch = preference.when().plus(Duration.ofMinutes(accessMin));
+            JourneyLegDTO rail = null;
+            for (JourneyLegDTO leg : railLegs) {
+                Instant dep = parseInstantOrNull(leg.startTime());
+                if (dep != null && !dep.isBefore(earliestCatch)) {
+                    rail = leg;
+                    break;
+                }
+            }
+            if (rail == null) {
+                // Nessun treno prendibile entro la finestra dato il cammino d'accesso: non iniettare.
+                return null;
+            }
+            String railStart = rail.startTime();
+            String railEnd = rail.endTime();
+            if (railStart == null || railEnd == null) {
+                return null;
+            }
+
+            String accessStart = shiftIso(railStart, -accessMin);
+            String egressEnd = shiftIso(railEnd, egressMin);
+
+            JourneyLegDTO accessWalk = new JourneyLegDTO(
+                    "WALK", null, null, null, null, null, null, null, null, null,
+                    null, board.name(), accessStart, railStart, accessMin, null,
+                    fromLat, fromLon, board.lat(), board.lon(), null, List.of());
+            JourneyLegDTO egressWalk = new JourneyLegDTO(
+                    "WALK", null, null, null, null, null, null, null, null, null,
+                    alight.name(), null, railEnd, egressEnd, egressMin, null,
+                    alight.lat(), alight.lon(), toLat, toLon, null, List.of());
+
+            Integer railMin = rail.durationMinutes() != null ? rail.durationMinutes() : diffMinutes(railStart, railEnd);
+            int total = accessMin + (railMin != null ? railMin : 0) + egressMin;
+
+            Instant chosenDep = parseInstantOrNull(railStart);
+            List<String> altBoardings = railLegs.stream()
+                    .map(JourneyLegDTO::startTime)
+                    .filter(t -> {
+                        Instant i = parseInstantOrNull(t);
+                        return i != null && chosenDep != null && i.isAfter(chosenDep);
+                    })
+                    .distinct()
+                    .limit(5)
+                    .toList();
+
+            return new JourneyOptionDTO(
+                    total,
+                    accessMin + egressMin,
+                    null,
+                    0,
+                    accessStart,
+                    egressEnd,
+                    List.of(accessWalk, rail, egressWalk),
+                    altBoardings.isEmpty() ? null : altBoardings);
+        } catch (Exception e) {
+            log.debug("[JourneyPlanner] rail injection skipped: {}", e.toString());
+            return null;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private RailStation nearestRailStation(double lat, double lon) {
+        String q = String.format(Locale.ROOT,
+                "{ stopsByRadius(lat: %s, lon: %s, radius: %d) { edges { node { distance stop { name lat lon vehicleMode } } } } }",
+                trimDecimals(lat), trimDecimals(lon), railInjectionMaxStationMeters);
+        Map<String, Object> payload = postGraphQl(q);
+        if (payload == null) return null;
+        Map<String, Object> data = payload.get("data") instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
+        Map<String, Object> sbr = data.get("stopsByRadius") instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
+        List<Map<String, Object>> edges = sbr.get("edges") instanceof List<?> l
+                ? (List<Map<String, Object>>) (List<?>) l : List.of();
+        for (Map<String, Object> edge : edges) {
+            if (!(edge.get("node") instanceof Map<?, ?> nodeRaw)) continue;
+            Map<String, Object> node = (Map<String, Object>) nodeRaw;
+            if (!(node.get("stop") instanceof Map<?, ?> stopRaw)) continue;
+            Map<String, Object> stop = (Map<String, Object>) stopRaw;
+            String mode = toStringOrNull(stop.get("vehicleMode"));
+            if (mode == null || !mode.equalsIgnoreCase("RAIL")) continue;
+            Double slat = toDoubleOrNull(stop.get("lat"));
+            Double slon = toDoubleOrNull(stop.get("lon"));
+            if (slat == null || slon == null) continue;
+            return new RailStation(firstNonBlank(toStringOrNull(stop.get("name")), "Stazione"), slat, slon);
+        }
+        return null;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<JourneyLegDTO> railLegsBetween(RailStation a, RailStation b, TimePreference preference) {
+        String q = String.format(Locale.ROOT, """
+                { planConnection(
+                    origin:{location:{coordinate:{latitude:%s longitude:%s}}}
+                    destination:{location:{coordinate:{latitude:%s longitude:%s}}}
+                    dateTime:{ %s:"%s" } searchWindow:"%s"
+                    modes:{ transitOnly:true, transit:{ access:[WALK], egress:[WALK], transfer:WALK, transit:[{mode:RAIL}] } }
+                    first:5
+                  ){ edges{ node{ legs{ mode duration from{name} to{name} route{shortName longName agency{name gtfsId}} trip{tripShortName gtfsId} legGeometry{points} start{scheduledTime estimated{time}} end{scheduledTime estimated{time}} } } } } }
+                """,
+                trimDecimals(a.lat()), trimDecimals(a.lon()), trimDecimals(b.lat()), trimDecimals(b.lon()),
+                preference.graphQlField(), preference.when().toString(), searchWindow);
+        Map<String, Object> payload = postGraphQl(q);
+        if (payload == null) return List.of();
+        Map<String, Object> data = payload.get("data") instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
+        Map<String, Object> plan = data.get("planConnection") instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
+        List<Map<String, Object>> edges = plan.get("edges") instanceof List<?> l
+                ? (List<Map<String, Object>>) (List<?>) l : List.of();
+        List<JourneyLegDTO> out = new ArrayList<>();
+        for (Map<String, Object> edge : edges) {
+            if (!(edge.get("node") instanceof Map<?, ?> nodeRaw)) continue;
+            Map<String, Object> node = (Map<String, Object>) nodeRaw;
+            List<Map<String, Object>> legs = node.get("legs") instanceof List<?> l
+                    ? (List<Map<String, Object>>) (List<?>) l : List.of();
+            for (Map<String, Object> leg : legs) {
+                if (!"RAIL".equalsIgnoreCase(toStringOrNull(leg.get("mode")))) continue;
+                String lineCode = null, routeLong = null, agencyName = null, agencyId = null;
+                if (leg.get("route") instanceof Map<?, ?> route) {
+                    lineCode = toStringOrNull(route.get("shortName"));
+                    routeLong = toStringOrNull(route.get("longName"));
+                    if (route.get("agency") instanceof Map<?, ?> agency) {
+                        agencyName = toStringOrNull(agency.get("name"));
+                        agencyId = toStringOrNull(agency.get("gtfsId"));
+                    }
+                }
+                String tripShort = null, tripId = null;
+                if (leg.get("trip") instanceof Map<?, ?> trip) {
+                    tripShort = toStringOrNull(trip.get("tripShortName"));
+                    tripId = toStringOrNull(trip.get("gtfsId"));
+                }
+                String geometry = null;
+                if (leg.get("legGeometry") instanceof Map<?, ?> g) {
+                    geometry = toStringOrNull(g.get("points"));
+                }
+                String start = otpLegTime(leg.get("start"));
+                String end = otpLegTime(leg.get("end"));
+                String fromName = leg.get("from") instanceof Map<?, ?> f ? toStringOrNull(((Map<String, Object>) f).get("name")) : a.name();
+                String toName = leg.get("to") instanceof Map<?, ?> t ? toStringOrNull(((Map<String, Object>) t).get("name")) : b.name();
+                Integer dur = floatMinutes(leg.get("duration"));
+                if (dur == null) dur = diffMinutes(start, end);
+                out.add(new JourneyLegDTO(
+                        "RAIL", lineCode, lineCode, routeLong, agencyName, agencyId, tripShort, tripId,
+                        Boolean.TRUE, null, firstNonBlank(fromName, a.name()), firstNonBlank(toName, b.name()),
+                        start, end, dur, null,
+                        a.lat(), a.lon(), b.lat(), b.lon(), geometry, List.of()));
+                break; // una sola leg RAIL per itinerario
+            }
+        }
+        return out;
+    }
+
+    private int walkMinutesBetween(double lat1, double lon1, double lat2, double lon2) {
+        String q = String.format(Locale.ROOT, """
+                { planConnection(
+                    origin:{location:{coordinate:{latitude:%s longitude:%s}}}
+                    destination:{location:{coordinate:{latitude:%s longitude:%s}}}
+                    first:3
+                  ){ edges{ node{ duration legs{ mode } } } } }
+                """,
+                trimDecimals(lat1), trimDecimals(lon1), trimDecimals(lat2), trimDecimals(lon2));
+        Map<String, Object> payload = postGraphQl(q);
+        Integer best = parseWalkOnlyMinutes(payload);
+        if (best != null) return best;
+        // fallback: stima da distanza in linea d'aria con fattore detour
+        double meters = haversineMeters(lat1, lon1, lat2, lon2) * 1.3;
+        return (int) Math.max(1, Math.round(meters / Math.max(0.5, walkSpeed) / 60.0));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Integer parseWalkOnlyMinutes(Map<String, Object> payload) {
+        if (payload == null) return null;
+        Map<String, Object> data = payload.get("data") instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
+        Map<String, Object> plan = data.get("planConnection") instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
+        List<Map<String, Object>> edges = plan.get("edges") instanceof List<?> l
+                ? (List<Map<String, Object>>) (List<?>) l : List.of();
+        Integer best = null;
+        for (Map<String, Object> edge : edges) {
+            if (!(edge.get("node") instanceof Map<?, ?> nodeRaw)) continue;
+            Map<String, Object> node = (Map<String, Object>) nodeRaw;
+            List<Map<String, Object>> legs = node.get("legs") instanceof List<?> l
+                    ? (List<Map<String, Object>>) (List<?>) l : List.of();
+            boolean walkOnly = !legs.isEmpty() && legs.stream()
+                    .allMatch(lg -> {
+                        String m = toStringOrNull(lg.get("mode"));
+                        return m != null && (m.equalsIgnoreCase("WALK") || m.equalsIgnoreCase("foot"));
+                    });
+            if (!walkOnly) continue;
+            Integer dur = floatMinutes(node.get("duration"));
+            if (dur != null && (best == null || dur < best)) best = dur;
+        }
+        return best;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> postGraphQl(String query) {
+        try {
+            URI uri = resolveOtpGraphQlUri();
+            Map<String, Object> request = new LinkedHashMap<>();
+            request.put("query", query);
+            return webClient.post()
+                    .uri(uri)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .header("User-Agent", "gtfs-monitor/1.0 (rail-injection)")
+                    .bodyValue(request)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block(Duration.ofSeconds(Math.max(1, otpTimeoutSeconds)));
+        } catch (Exception e) {
+            log.debug("[JourneyPlanner] rail-injection GraphQL failed: {}", e.toString());
+            return null;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String otpLegTime(Object holder) {
+        if (!(holder instanceof Map<?, ?> raw)) return null;
+        Map<String, Object> m = (Map<String, Object>) raw;
+        if (m.get("estimated") instanceof Map<?, ?> est) {
+            String t = toStringOrNull(((Map<String, Object>) est).get("time"));
+            if (t != null) return t;
+        }
+        return toStringOrNull(m.get("scheduledTime"));
+    }
+
+    private static String shiftIso(String iso, long minutes) {
+        if (iso == null) return null;
+        try {
+            return OffsetDateTime.parse(iso).plusMinutes(minutes).toString();
+        } catch (Exception e) {
+            return iso;
+        }
+    }
+
+    private static double haversineMeters(double lat1, double lon1, double lat2, double lon2) {
+        double r = 6371000.0;
+        double dLat = Math.toRadians(lat2 - lat1);
+        double dLon = Math.toRadians(lon2 - lon1);
+        double h = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+                + Math.cos(Math.toRadians(lat1)) * Math.cos(Math.toRadians(lat2))
+                * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+        return 2 * r * Math.asin(Math.min(1.0, Math.sqrt(h)));
     }
 }
