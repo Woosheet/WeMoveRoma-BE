@@ -972,6 +972,12 @@ public class JourneyPlannerService {
         Map<String, Object> sbr = data.get("stopsByRadius") instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
         List<Map<String, Object>> edges = sbr.get("edges") instanceof List<?> l
                 ? (List<Map<String, Object>>) (List<?>) l : List.of();
+        // stopsByRadius ordina i risultati con una metrica che non coincide con la
+        // distanza euclidea reale (es. Manhattan). Scorro tutti i nodi RAIL nel
+        // raggio e scelgo il piu' vicino per haversine: piu' robusto se le coords
+        // di una stazione nel feed sono leggermente off.
+        RailStation best = null;
+        double bestMeters = Double.MAX_VALUE;
         for (Map<String, Object> edge : edges) {
             if (!(edge.get("node") instanceof Map<?, ?> nodeRaw)) continue;
             Map<String, Object> node = (Map<String, Object>) nodeRaw;
@@ -982,9 +988,13 @@ public class JourneyPlannerService {
             Double slat = toDoubleOrNull(stop.get("lat"));
             Double slon = toDoubleOrNull(stop.get("lon"));
             if (slat == null || slon == null) continue;
-            return new RailStation(firstNonBlank(toStringOrNull(stop.get("name")), "Stazione"), slat, slon);
+            double meters = haversineMeters(lat, lon, slat, slon);
+            if (meters < bestMeters) {
+                bestMeters = meters;
+                best = new RailStation(firstNonBlank(toStringOrNull(stop.get("name")), "Stazione"), slat, slon);
+            }
         }
-        return null;
+        return best;
     }
 
     @SuppressWarnings("unchecked")
