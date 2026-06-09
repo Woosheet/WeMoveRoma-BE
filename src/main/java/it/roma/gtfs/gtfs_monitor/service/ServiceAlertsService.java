@@ -234,28 +234,57 @@ public class ServiceAlertsService {
         return out;
     }
 
+    /**
+     * Titolo push: prefisso emoji per severity + lista linee (se brevi) + effetto.
+     * Esempi reali:
+     *   🚨 Linee 31, 32 — Servizio sospeso
+     *   ⚠️ Linea 49 — Deviazione
+     *   🚨 Servizio sospeso (se non ci sono routes)
+     */
     private static String buildPushTitle(ServiceAlertDTO dto) {
-        // Prefisso "🚨" su SEVERE per dare riconoscibilita' nella drawer.
         String prefix = "SEVERE".equalsIgnoreCase(dto.getSeverita()) ? "🚨 " : "⚠️ ";
-        String header = dto.getTitolo();
-        if (header == null || header.isBlank()) {
-            header = dto.getEffetto() != null ? dto.getEffetto() : "Avviso WeMoveRoma";
+        String routesPart = routesShort(dto.getRouteIds());
+        String effetto = dto.getEffetto();
+        if (effetto == null || effetto.isBlank()) {
+            // Fallback al titolo upstream se l'effetto manca
+            String header = dto.getTitolo();
+            if (header == null || header.isBlank()) header = "Avviso WeMoveRoma";
+            return prefix + truncate(routesPart == null ? header : routesPart + " — " + header, 70);
         }
-        // Tronchiamo: nei banner sopra ~50 chars iOS taglia.
-        return prefix + truncate(header, 60);
+        if (routesPart != null) {
+            return prefix + truncate(routesPart + " — " + effetto, 70);
+        }
+        return prefix + truncate(effetto, 70);
     }
 
+    /**
+     * Body push: descrizione GTFS pulita, senza ripetere le linee gia' nel titolo.
+     * Tronca a 180 char (oltre, iOS taglia col "..." automatico).
+     */
     private static String buildPushBody(ServiceAlertDTO dto) {
+        String desc = dto.getDescrizione();
+        if (desc != null && !desc.isBlank()) {
+            return truncate(desc.trim(), 180);
+        }
+        // Niente descrizione: usa il titolo upstream o ricostruisci dall'effetto+causa
+        if (dto.getTitolo() != null && !dto.getTitolo().isBlank()) {
+            return truncate(dto.getTitolo(), 180);
+        }
         StringBuilder sb = new StringBuilder();
-        if (dto.getRouteIds() != null && !dto.getRouteIds().isEmpty()) {
-            sb.append("Linee: ").append(String.join(", ", dto.getRouteIds())).append(". ");
-        }
-        if (dto.getDescrizione() != null && !dto.getDescrizione().isBlank()) {
-            sb.append(dto.getDescrizione());
-        } else if (dto.getEffetto() != null) {
-            sb.append(dto.getEffetto());
-        }
+        if (dto.getCausa() != null) sb.append(dto.getCausa()).append(". ");
+        if (dto.getEffetto() != null) sb.append(dto.getEffetto()).append('.');
         return truncate(sb.toString().trim(), 180);
+    }
+
+    /**
+     * Formatta routes per il titolo. Per 1-3 linee → "Linea X" o "Linee X, Y, Z".
+     * Per piu' linee → "5 linee" (titoli troppo lunghi sono brutti nella drawer).
+     */
+    private static String routesShort(List<String> routes) {
+        if (routes == null || routes.isEmpty()) return null;
+        if (routes.size() == 1) return "Linea " + routes.get(0);
+        if (routes.size() <= 3) return "Linee " + String.join(", ", routes);
+        return routes.size() + " linee";
     }
 
     private static Map<String, String> buildPushData(ServiceAlertDTO dto) {

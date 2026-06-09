@@ -40,6 +40,12 @@ import java.util.regex.Pattern;
 public class StrikeService {
 
     private static final DateTimeFormatter D_MM_YYYY = DateTimeFormatter.ofPattern("dd/MM/yyyy", Locale.ITALIAN);
+    /** Per push: "Venerdì 12 giugno" (no anno, leggibile). */
+    private static final DateTimeFormatter DAY_NAME = DateTimeFormatter.ofPattern("EEEE d MMMM", Locale.ITALIAN);
+    /** Estrae intervallo orario "DALLE 9.30 ALLE 12.30" → ("9.30","12.30"). */
+    private static final Pattern TIME_WINDOW = Pattern.compile(
+            "DALLE\\s+(\\d{1,2}[\\.,:]?\\d{0,2})\\s+ALLE\\s+(\\d{1,2}[\\.,:]?\\d{0,2})",
+            Pattern.CASE_INSENSITIVE);
     private static final Pattern GUID_ID = Pattern.compile(".*?/(\\d+)\\s*$");
 
     private final WebClient webClient;
@@ -198,7 +204,7 @@ public class StrikeService {
         for (StrikeDTO s : strikes) {
             if (s.getId() == null) continue;
             if (!dispatchTracker.markIfNew(s.getId())) continue;
-            String title = "🛑 Sciopero " + nonNullOrDefault(s.getSettore(), "trasporti");
+            String title = buildTitle(s);
             String body = buildBody(s);
             Map<String, String> data = new HashMap<>();
             data.put("kind", "strike");
@@ -215,19 +221,108 @@ public class StrikeService {
         if (sent > 0) log.info("[Strikes] dispatched {} push.", sent);
     }
 
-    private static String buildBody(StrikeDTO s) {
-        StringBuilder sb = new StringBuilder();
-        if (s.getDataInizio() != null) {
-            sb.append(s.getDataInizio().format(D_MM_YYYY));
-            if (s.getDataFine() != null && !s.getDataFine().equals(s.getDataInizio())) {
-                sb.append("–").append(s.getDataFine().format(D_MM_YYYY));
+    /**
+     * Titolo push: "🛑 [Sciopero bus e metro|treni|trasporti] — [giorno della settimana]".
+     * Esempi reali:
+     *   🛑 Sciopero bus e metro — Venerdì 12 giugno
+     *   🛑 Sciopero treni — Lunedì 24 giugno
+     */
+    static String buildTitle(StrikeDTO s) {
+        String label = shortSectorLabel(s.getSettore());
+        String when;
+        LocalDate d = s.getDataInizio();
+        if (d == null) {
+            when = "in arrivo";
+        } else {
+            // Capitalizza il giorno della settimana (italiano lo dà minuscolo)
+            String formatted = d.format(DAY_NAME);
+            when = capitalizeFirst(formatted);
+            if (s.getDataFine() != null && !s.getDataFine().equals(d)) {
+                when += " → " + capitalizeFirst(s.getDataFine().format(DAY_NAME));
             }
-            sb.append(". ");
         }
-        if (s.getModalita() != null) sb.append(s.getModalita()).append(". ");
-        if (s.getRilevanza() != null) sb.append("Rilevanza: ").append(s.getRilevanza()).append(". ");
-        String r = sb.toString().trim();
+        return "🛑 " + label + " — " + when;
+    }
+
+    /**
+     * Body push: orari estratti dalla modalita' in formato pulito + scope geografico
+     * in linguaggio naturale.
+     * Esempi reali:
+     *   Stop dalle 9:30 alle 12:30 nel Lazio. Tocca per i dettagli.
+     *   Stop dalle 9:00 alle 13:00 - Nazionale. Tocca per i dettagli.
+     */
+    static String buildBody(StrikeDTO s) {
+        StringBuilder sb = new StringBuilder();
+        String window = extractTimeWindow(s.getModalita());
+        if (window != null) {
+            sb.append("Stop ").append(window).append(' ');
+        } else if (s.getModalita() != null && !s.getModalita().isBlank()) {
+            // Fallback: prendi la modalita' grezza in lower-sentence
+            String low = s.getModalita().trim().toLowerCase(Locale.ITALIAN);
+            sb.append(capitalizeFirst(low)).append(". ");
+        }
+        // Geographic scope umano
+        String scope = humanScope(s);
+        if (scope != null) sb.append(scope).append(". ");
+        sb.append("Tocca per i dettagli.");
+        String r = sb.toString().trim().replaceAll("\\s+", " ");
         return r.length() > 180 ? r.substring(0, 179) + "…" : r;
+    }
+
+    /** Mappa "Trasporto pubblico locale" → "Sciopero bus e metro", "Trasporto ferroviario" → "Sciopero treni". */
+    private static String shortSectorLabel(String settore) {
+        if (settore == null || settore.isBlank()) return "Sciopero trasporti";
+        String s = settore.toLowerCase(Locale.ITALIAN);
+        if (s.contains("pubblico locale")) return "Sciopero bus e metro";
+        if (s.contains("ferroviario") || s.contains("treno")) return "Sciopero treni";
+        return "Sciopero " + settore.toLowerCase(Locale.ITALIAN);
+    }
+
+    /** "DALLE 9.30 ALLE 12.30" → "dalle 9:30 alle 12:30". Null se non matcha. */
+    private static String extractTimeWindow(String modalita) {
+        if (modalita == null) return null;
+        Matcher m = TIME_WINDOW.matcher(modalita);
+        if (!m.find()) return null;
+        return "dalle " + normalizeTime(m.group(1)) + " alle " + normalizeTime(m.group(2));
+    }
+
+    /** "9.30" / "930" / "9:30" → "9:30". "9" → "9:00". */
+    private static String normalizeTime(String raw) {
+        if (raw == null) return "";
+        String clean = raw.replace(".", ":").replace(",", ":");
+        if (!clean.contains(":")) {
+            // "9" → "9:00", "930" → "9:30" (improbabile ma copro)
+            if (clean.length() <= 2) return clean + ":00";
+            return clean.substring(0, clean.length() - 2) + ":" + clean.substring(clean.length() - 2);
+        }
+        // assicura formato H:MM con minuti a 2 cifre
+        String[] parts = clean.split(":", 2);
+        String h = parts[0];
+        String mm = parts.length > 1 ? parts[1] : "00";
+        if (mm.length() == 1) mm = mm + "0";
+        if (mm.isEmpty()) mm = "00";
+        return h + ":" + mm;
+    }
+
+    /**
+     * "Nazionale" se regione Italia; "in [Regione]" se Regionale; "Provincia di X"
+     * se provincia specifica (non "Tutte"). Null se nessun campo utile.
+     */
+    private static String humanScope(StrikeDTO s) {
+        String prov = s.getProvincia();
+        if (prov != null && !prov.isBlank() && !prov.equalsIgnoreCase("Tutte")) {
+            return "Provincia di " + prov;
+        }
+        String reg = s.getRegione();
+        if (reg == null) return null;
+        reg = reg.trim();
+        if (reg.equalsIgnoreCase("Italia")) return "Nazionale";
+        return "in " + reg;
+    }
+
+    private static String capitalizeFirst(String s) {
+        if (s == null || s.isEmpty()) return s;
+        return Character.toUpperCase(s.charAt(0)) + s.substring(1);
     }
 
     // === Helpers ===
@@ -287,10 +382,6 @@ public class StrikeService {
         if (s == null) return null;
         String t = s.trim();
         return t.isEmpty() ? null : t;
-    }
-
-    private static String nonNullOrDefault(String s, String def) {
-        return (s == null || s.isBlank()) ? def : s;
     }
 
     private static List<String> csvLower(String csv) {
