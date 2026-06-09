@@ -5,6 +5,7 @@ import it.roma.gtfs.gtfs_monitor.config.GtfsProperties;
 import it.roma.gtfs.gtfs_monitor.model.dto.ServiceAlertDTO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -24,10 +25,20 @@ public class ServiceAlertsService {
     private static final int MAX_LIMIT = 5_000;
     private final GtfsProperties props;
     private final WebClient webClient;
+    private final FcmDispatcherService fcmDispatcher;
+    private final AlertsDispatchTracker dispatchTracker;
     private final AtomicReference<CacheEntry<List<ServiceAlertDTO>>> cacheRef =
             new AtomicReference<>(CacheEntry.empty());
     private final Object refreshLock = new Object();
     private static final ZoneId ROME = ZoneId.of("Europe/Rome");
+
+    /** Severities GTFS-RT che fanno scattare la push. Default = SEVERE + WARNING. */
+    @Value("${notifications.alerts.severities:SEVERE,WARNING}")
+    private String alertSeveritiesCsv;
+
+    /** Numero massimo di push per refresh: backstop anti-flood. */
+    @Value("${notifications.alerts.max-per-refresh:5}")
+    private int maxAlertsPerRefresh;
 
 
     private static final Map<String, String> CAUSE_IT = Map.ofEntries(
@@ -164,11 +175,106 @@ public class ServiceAlertsService {
                 List<ServiceAlertDTO> fresh = fetchRemoteSnapshot();
                 if (!fresh.isEmpty() || current.isEmpty()) {
                     cacheRef.set(new CacheEntry<>(List.copyOf(fresh), System.currentTimeMillis()));
+                    dispatchNewAlertsToFcm(fresh);
                 }
             } catch (Exception e) {
                 log.warn("[ServiceAlerts] refresh cache fallito: {}", e.toString());
             }
         }
+    }
+
+    /**
+     * Per ogni alert nello snapshot fresco: se filtra (severity) e non e' mai
+     * stato visto (AlertsDispatchTracker), invia una push al topic FCM.
+     * Backstop {@code maxAlertsPerRefresh}: se ci sono N alert nuovi in un colpo
+     * (es. primo run dopo deploy) spediamo solo i primi N evitando flood.
+     */
+    private void dispatchNewAlertsToFcm(List<ServiceAlertDTO> fresh) {
+        if (fresh == null || fresh.isEmpty()) return;
+        Set<String> wanted = parseSeverities(alertSeveritiesCsv);
+        int sent = 0;
+        // Dedup per id base nello stesso ciclo: lo stesso alert con piu' active
+        // periods viene espanso in piu' DTO ma vogliamo una sola push.
+        Set<String> sentThisCycle = new HashSet<>();
+        for (ServiceAlertDTO dto : fresh) {
+            if (sent >= maxAlertsPerRefresh) break;
+            String id = dto.getId();
+            if (id == null || id.isBlank()) continue;
+            if (!sentThisCycle.add(id)) continue;
+
+            if (!wanted.isEmpty() && (dto.getSeverita() == null || !wanted.contains(dto.getSeverita().toUpperCase(Locale.ROOT)))) {
+                continue;
+            }
+            // Key dispatch: id+inizio_epoch — un alert con stesso id ma diverso
+            // active period e' un evento ri-comunicabile.
+            String dispatchKey = id + "@" + (dto.getInizio() == null ? "" : dto.getInizio().getEpochSecond());
+            if (!dispatchTracker.markIfNew(dispatchKey)) {
+                continue;
+            }
+
+            String title = buildPushTitle(dto);
+            String body  = buildPushBody(dto);
+            Map<String, String> data = buildPushData(dto);
+            if (fcmDispatcher.sendToTopic(fcmDispatcher.topicAlerts(), title, body, data)) {
+                sent++;
+            }
+        }
+        if (sent > 0) {
+            log.info("[ServiceAlerts] dispatched {} push notifications (cycle).", sent);
+        }
+    }
+
+    private static Set<String> parseSeverities(String csv) {
+        if (csv == null || csv.isBlank()) return Set.of();
+        Set<String> out = new HashSet<>();
+        for (String s : csv.split(",")) {
+            String n = s.trim().toUpperCase(Locale.ROOT);
+            if (!n.isEmpty()) out.add(n);
+        }
+        return out;
+    }
+
+    private static String buildPushTitle(ServiceAlertDTO dto) {
+        // Prefisso "🚨" su SEVERE per dare riconoscibilita' nella drawer.
+        String prefix = "SEVERE".equalsIgnoreCase(dto.getSeverita()) ? "🚨 " : "⚠️ ";
+        String header = dto.getTitolo();
+        if (header == null || header.isBlank()) {
+            header = dto.getEffetto() != null ? dto.getEffetto() : "Avviso WeMoveRoma";
+        }
+        // Tronchiamo: nei banner sopra ~50 chars iOS taglia.
+        return prefix + truncate(header, 60);
+    }
+
+    private static String buildPushBody(ServiceAlertDTO dto) {
+        StringBuilder sb = new StringBuilder();
+        if (dto.getRouteIds() != null && !dto.getRouteIds().isEmpty()) {
+            sb.append("Linee: ").append(String.join(", ", dto.getRouteIds())).append(". ");
+        }
+        if (dto.getDescrizione() != null && !dto.getDescrizione().isBlank()) {
+            sb.append(dto.getDescrizione());
+        } else if (dto.getEffetto() != null) {
+            sb.append(dto.getEffetto());
+        }
+        return truncate(sb.toString().trim(), 180);
+    }
+
+    private static Map<String, String> buildPushData(ServiceAlertDTO dto) {
+        Map<String, String> out = new java.util.HashMap<>();
+        out.put("kind", "alert");
+        if (dto.getId() != null) out.put("alertId", dto.getId());
+        if (dto.getRouteIds() != null && !dto.getRouteIds().isEmpty()) {
+            out.put("routes", String.join(",", dto.getRouteIds()));
+        }
+        if (dto.getSeverita() != null) out.put("severity", dto.getSeverita());
+        // Deep link interno: la app potra' aprirlo direttamente sulla schermata Avvisi.
+        out.put("deeplink", "wemoveroma://alerts");
+        return out;
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        if (s.length() <= max) return s;
+        return s.substring(0, Math.max(0, max - 1)).trim() + "…";
     }
 
     private List<ServiceAlertDTO> fetchRemoteSnapshot() {

@@ -110,6 +110,15 @@
             <version>2.9.1</version>
         </dependency>
 
+        <!-- Firebase Admin SDK: dispatching push notifications to FCM topics
+             (avvisi GTFS-RT nuovi, scioperi). No-op a runtime se le credenziali
+             non sono fornite via GOOGLE_APPLICATION_CREDENTIALS o fcm.credentials-path. -->
+        <dependency>
+            <groupId>com.google.firebase</groupId>
+            <artifactId>firebase-admin</artifactId>
+            <version>9.4.3</version>
+        </dependency>
+
     </dependencies>
 
     <build>
