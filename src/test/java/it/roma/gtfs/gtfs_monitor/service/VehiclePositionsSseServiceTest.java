@@ -1,5 +1,6 @@
 package it.roma.gtfs.gtfs_monitor.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import it.roma.gtfs.gtfs_monitor.config.GtfsProperties;
 import it.roma.gtfs.gtfs_monitor.model.dto.VehiclePositionDTO;
 import org.junit.jupiter.api.Test;
@@ -82,6 +83,6 @@ class VehiclePositionsSseServiceTest {
         GtfsIndexService indexService = new GtfsIndexService(props);
         indexService.init();
         indexService.rebuildIndexes();
-        return new VehiclePositionsSseService(indexService);
+        return new VehiclePositionsSseService(indexService, new ObjectMapper());
     }
 }

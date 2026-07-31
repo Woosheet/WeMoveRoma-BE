@@ -1,6 +1,7 @@
 package it.roma.gtfs.gtfs_monitor.service;
 
 import it.roma.gtfs.gtfs_monitor.config.GtfsProperties;
+import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
@@ -20,6 +21,8 @@ import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Enumeration;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
@@ -38,6 +41,17 @@ public class StaticGtfsUpdater {
 
     private volatile boolean refreshFailed = false;
     private final AtomicBoolean refreshInProgress = new AtomicBoolean(false);
+
+    /**
+     * Executor dedicato al refresh pesante (download zip + parsing CSV + rebuild indici):
+     * i metodi @Scheduled si limitano a sottomettere il lavoro qui e ritornano subito,
+     * senza occupare il pool dello scheduler condiviso con i poll GTFS-RT.
+     */
+    private final ExecutorService refreshExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "static-gtfs-refresh");
+        t.setDaemon(true);
+        return t;
+    });
 
     public StaticGtfsUpdater(GtfsProperties props,
                              @Qualifier("staticGtfsWebClient") WebClient http,
@@ -67,20 +81,30 @@ public class StaticGtfsUpdater {
      */
     @Scheduled(cron = "0 40 6,20 * * *", zone = "Europe/Rome")
     public void scheduledDailyRefresh() {
-        runRefresh("cron");
+        refreshExecutor.execute(() -> runRefresh("cron"));
     }
 
     /**
      * Job di retry: ogni 5 minuti controlla se l’ultimo refresh è fallito.
      * Se refreshFailed == true → ritenta; se va bene rimette refreshFailed = false e smette.
      */
-    @Scheduled(fixedDelay = 5 * 60 * 1000L, initialDelay = 5 * 60 * 1000L, zone = "Europe/Rome")
+    @Scheduled(fixedDelay = 5 * 60 * 1000L, initialDelay = 5 * 60 * 1000L)
     public void scheduledRetryIfFailed() {
         if (!refreshFailed) {
             return;
         }
         log.warn("[StaticGTFS] Ultimo refresh FALLITO: provo un retry ogni 5 minuti…");
-        runRefresh("retry-5m");
+        refreshExecutor.execute(() -> {
+            // ricontrollo: un refresh accodato prima potrebbe aver già risolto
+            if (refreshFailed) {
+                runRefresh("retry-5m");
+            }
+        });
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        refreshExecutor.shutdownNow();
     }
 
     // -------------------------------------------------------

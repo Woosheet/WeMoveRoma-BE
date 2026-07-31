@@ -11,11 +11,17 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
@@ -28,6 +34,12 @@ import java.util.concurrent.atomic.AtomicReference;
 @RequiredArgsConstructor
 public class GtfsIndexService {
     private static final ZoneId ROME_ZONE = ZoneId.of("Europe/Rome");
+    // Guardrail sulla dimensione totale dei range letti per un singolo trip: un trip reale
+    // occupa pochi KB; oltre questa soglia l'indice e' considerato incoerente e si fa fallback.
+    private static final long MAX_TRIP_RANGE_BYTES = 16L << 20;
+    // Stesso spirito dell'hardening maxCharsPerColumn del parser: un trip_id oltre questa
+    // soglia e' un feed malformato e non viene accumulato oltre.
+    private static final int MAX_TRIP_ID_BYTES = 1 << 14;
 
     private final GtfsProperties props;
     private Path dataDir;
@@ -35,6 +47,7 @@ public class GtfsIndexService {
     private final AtomicReference<Indexes> ref = new AtomicReference<>(Indexes.EMPTY);
     private final AtomicReference<Map<LocalDate, ScheduledStopIndex>> scheduledByDateRef = new AtomicReference<>(Map.of());
     private final AtomicReference<Map<LocalDate, ActiveTripIndex>> activeTripsByDateRef = new AtomicReference<>(Map.of());
+    private final AtomicReference<StopTimesOffsetIndex> stopTimesOffsetsRef = new AtomicReference<>(StopTimesOffsetIndex.EMPTY);
 
     @PostConstruct
     void init() {
@@ -49,6 +62,7 @@ public class GtfsIndexService {
         Path routesPath = dataDir.resolve("routes.txt");
         Path shapesPath = dataDir.resolve("shapes.txt");
         Path calendarDatesPath = dataDir.resolve("calendar_dates.txt");
+        Path stopTimesPath = dataDir.resolve("stop_times.txt");
 
         Map<String, Stop> stops = loadStops(stopsPath);
         Map<String, String> routeShortNames = loadRouteShortNames(routesPath);
@@ -58,6 +72,7 @@ public class GtfsIndexService {
         Map<String, Set<String>> byRoute = buildRouteIndex(trips);
         Map<String, Set<String>> destinationsByRoute = buildDestinationsIndex(trips);
         Map<String, Set<String>> routeIdsByLine = buildRouteIdsByLineIndex(routeShortNames, byRoute.keySet());
+        StopTimesOffsetIndex stopTimesOffsets = buildStopTimesOffsetIndex(stopTimesPath, trips);
 
         ref.set(new Indexes(
                 stops,
@@ -70,6 +85,7 @@ public class GtfsIndexService {
                 calendarDates.addedByDate(),
                 calendarDates.removedByDate()
         ));
+        stopTimesOffsetsRef.set(stopTimesOffsets);
         scheduledByDateRef.set(Map.of());
         activeTripsByDateRef.set(Map.of());
 
@@ -808,45 +824,28 @@ public class GtfsIndexService {
             return List.of();
         }
 
-        long serviceStartEpochSeconds = serviceDate.atStartOfDay(ROME_ZONE).toEpochSecond();
-        List<ScheduledTripStop> out = new ArrayList<>(limit);
-        try (InputStream is = new BufferedInputStream(Files.newInputStream(stopTimesPath))) {
-            CsvParser parser = newParser();
-            parser.beginParsing(is, StandardCharsets.UTF_8);
-            Record r;
-            while ((r = parser.parseNextRecord()) != null) {
-                if (!trip.tripId().equals(r.getString("trip_id"))) continue;
-
-                Integer arrivalTimeSeconds = parseGtfsTimeToSeconds(r.getString("arrival_time"));
-                Integer departureTimeSeconds = parseGtfsTimeToSeconds(r.getString("departure_time"));
-                Integer bestTimeSeconds = arrivalTimeSeconds != null ? arrivalTimeSeconds : departureTimeSeconds;
-                if (bestTimeSeconds == null) continue;
-
-                long bestEpochSeconds = serviceStartEpochSeconds + bestTimeSeconds;
-                if (bestEpochSeconds < nowEpochSeconds - 5 * 60L) continue;
-
-                String stopId = r.getString("stop_id");
-                Stop stop = stopByIdOrNull(stopId);
-                out.add(new ScheduledTripStop(
-                        stopId,
-                        stop != null ? stop.name() : null,
-                        trip.tripId(),
-                        publicLineByRouteId(trip.routeId()),
-                        stop != null && stop.lat() != null ? stop.lat().doubleValue() : null,
-                        stop != null && stop.lon() != null ? stop.lon().doubleValue() : null,
-                        toInstantOrNull(serviceStartEpochSeconds, arrivalTimeSeconds),
-                        toInstantOrNull(serviceStartEpochSeconds, departureTimeSeconds)
-                ));
-                if (out.size() >= limit) {
-                    break;
-                }
-            }
-            parser.stopParsing();
+        List<StopTimeRow> rows;
+        try {
+            rows = stopTimeRowsForTrip(trip.tripId(), stopTimesPath);
         } catch (IOException e) {
             log.error("[GTFS-Index] Errore leggendo stop_times per trip {}: {}", trip.tripId(), e.toString());
             return List.of();
         }
 
+        long serviceStartEpochSeconds = serviceDate.atStartOfDay(ROME_ZONE).toEpochSecond();
+        List<ScheduledTripStop> out = new ArrayList<>(Math.min(limit, rows.size()));
+        for (StopTimeRow row : rows) {
+            Integer bestTimeSeconds = row.arrivalTimeSeconds() != null ? row.arrivalTimeSeconds() : row.departureTimeSeconds();
+            if (bestTimeSeconds == null) continue;
+
+            long bestEpochSeconds = serviceStartEpochSeconds + bestTimeSeconds;
+            if (bestEpochSeconds < nowEpochSeconds - 5 * 60L) continue;
+
+            out.add(toScheduledTripStop(trip, row, serviceStartEpochSeconds));
+            if (out.size() >= limit) {
+                break;
+            }
+        }
         return List.copyOf(out);
     }
 
@@ -861,38 +860,182 @@ public class GtfsIndexService {
             return List.of();
         }
 
-        long serviceStartEpochSeconds = serviceDate.atStartOfDay(ROME_ZONE).toEpochSecond();
-        List<ScheduledTripStop> out = new ArrayList<>();
-        try (InputStream is = new BufferedInputStream(Files.newInputStream(stopTimesPath))) {
-            CsvParser parser = newParser();
-            parser.beginParsing(is, StandardCharsets.UTF_8);
-            Record r;
-            while ((r = parser.parseNextRecord()) != null) {
-                if (!trip.tripId().equals(r.getString("trip_id"))) continue;
-
-                Integer arrivalTimeSeconds = parseGtfsTimeToSeconds(r.getString("arrival_time"));
-                Integer departureTimeSeconds = parseGtfsTimeToSeconds(r.getString("departure_time"));
-                String stopId = r.getString("stop_id");
-                Stop stop = stopByIdOrNull(stopId);
-
-                out.add(new ScheduledTripStop(
-                        stopId,
-                        stop != null ? stop.name() : null,
-                        trip.tripId(),
-                        publicLineByRouteId(trip.routeId()),
-                        stop != null && stop.lat() != null ? stop.lat().doubleValue() : null,
-                        stop != null && stop.lon() != null ? stop.lon().doubleValue() : null,
-                        toInstantOrNull(serviceStartEpochSeconds, arrivalTimeSeconds),
-                        toInstantOrNull(serviceStartEpochSeconds, departureTimeSeconds)
-                ));
-            }
-            parser.stopParsing();
+        List<StopTimeRow> rows;
+        try {
+            rows = stopTimeRowsForTrip(trip.tripId(), stopTimesPath);
         } catch (IOException e) {
             log.error("[GTFS-Index] Errore leggendo stop_times completi per trip {}: {}", trip.tripId(), e.toString());
             return List.of();
         }
 
+        long serviceStartEpochSeconds = serviceDate.atStartOfDay(ROME_ZONE).toEpochSecond();
+        List<ScheduledTripStop> out = new ArrayList<>(rows.size());
+        for (StopTimeRow row : rows) {
+            out.add(toScheduledTripStop(trip, row, serviceStartEpochSeconds));
+        }
         return List.copyOf(out);
+    }
+
+    private ScheduledTripStop toScheduledTripStop(Trip trip, StopTimeRow row, long serviceStartEpochSeconds) {
+        Stop stop = stopByIdOrNull(row.stopId());
+        return new ScheduledTripStop(
+                row.stopId(),
+                stop != null ? stop.name() : null,
+                trip.tripId(),
+                publicLineByRouteId(trip.routeId()),
+                stop != null && stop.lat() != null ? stop.lat().doubleValue() : null,
+                stop != null && stop.lon() != null ? stop.lon().doubleValue() : null,
+                toInstantOrNull(serviceStartEpochSeconds, row.arrivalTimeSeconds()),
+                toInstantOrNull(serviceStartEpochSeconds, row.departureTimeSeconds())
+        );
+    }
+
+    /**
+     * Estrae le righe di stop_times per un singolo trip nell'ordine del file (= stop_sequence).
+     * Percorso veloce: legge solo i byte-range del trip dall'indice offset e li riparsa con
+     * lo stesso parser del percorso lento. Se l'indice non e' allineato al file su disco
+     * (es. feed appena sostituito, rebuild non ancora completato) fa fallback alla scansione completa.
+     */
+    private List<StopTimeRow> stopTimeRowsForTrip(String tripId, Path stopTimesPath) throws IOException {
+        StopTimesOffsetIndex index = stopTimesOffsetsRef.get();
+        if (index.isUsableFor(stopTimesPath)) {
+            long[] ranges = index.rangesByTripId().get(tripId);
+            if (ranges == null) {
+                return List.of();
+            }
+            byte[] payload = readRangesWithHeader(stopTimesPath, index.headerBytes(), ranges);
+            if (payload != null) {
+                return parseStopTimeRows(new ByteArrayInputStream(payload), tripId);
+            }
+            // Range incoerente col file: si ricade sulla scansione completa.
+        }
+        try (InputStream is = new BufferedInputStream(Files.newInputStream(stopTimesPath))) {
+            return parseStopTimeRows(is, tripId);
+        }
+    }
+
+    private List<StopTimeRow> parseStopTimeRows(InputStream is, String tripId) {
+        List<StopTimeRow> rows = new ArrayList<>(32);
+        CsvParser parser = newParser();
+        parser.beginParsing(is, StandardCharsets.UTF_8);
+        Record r;
+        while ((r = parser.parseNextRecord()) != null) {
+            if (!tripId.equals(r.getString("trip_id"))) continue;
+            rows.add(new StopTimeRow(
+                    r.getString("stop_id"),
+                    parseGtfsTimeToSeconds(r.getString("arrival_time")),
+                    parseGtfsTimeToSeconds(r.getString("departure_time"))
+            ));
+        }
+        parser.stopParsing();
+        return rows;
+    }
+
+    private static byte[] readRangesWithHeader(Path stopTimesPath, byte[] headerBytes, long[] ranges) throws IOException {
+        long total = headerBytes.length;
+        for (int i = 0; i < ranges.length; i += 2) {
+            total += ranges[i + 1] - ranges[i];
+        }
+        if (total > MAX_TRIP_RANGE_BYTES) {
+            return null;
+        }
+
+        byte[] out = new byte[(int) total];
+        System.arraycopy(headerBytes, 0, out, 0, headerBytes.length);
+        int pos = headerBytes.length;
+        try (FileChannel channel = FileChannel.open(stopTimesPath, StandardOpenOption.READ)) {
+            for (int i = 0; i < ranges.length; i += 2) {
+                int len = (int) (ranges[i + 1] - ranges[i]);
+                ByteBuffer buf = ByteBuffer.wrap(out, pos, len);
+                while (buf.hasRemaining()) {
+                    int n = channel.read(buf, ranges[i] + (len - buf.remaining()));
+                    if (n < 0) {
+                        // File troncato rispetto all'indice: segnala incoerenza al chiamante.
+                        return null;
+                    }
+                }
+                pos += len;
+            }
+        }
+        return out;
+    }
+
+    private StopTimesOffsetIndex buildStopTimesOffsetIndex(Path stopTimesPath, Map<String, Trip> trips) {
+        if (!Files.exists(stopTimesPath)) {
+            log.warn("[GTFS-Index] stop_times.txt non trovato in {}: indice offset non disponibile", stopTimesPath);
+            return StopTimesOffsetIndex.EMPTY;
+        }
+
+        long t0 = System.nanoTime();
+        try {
+            long fileSize = Files.size(stopTimesPath);
+            long lastModifiedMillis = Files.getLastModifiedTime(stopTimesPath).toMillis();
+
+            StopTimesOffsetScanner scanner = new StopTimesOffsetScanner(trips);
+            try (InputStream is = Files.newInputStream(stopTimesPath)) {
+                byte[] chunk = new byte[1 << 20];
+                long pos = 0L;
+                int n;
+                while (!scanner.headerFailed && (n = is.read(chunk)) > 0) {
+                    for (int i = 0; i < n; i++, pos++) {
+                        scanner.accept(chunk[i], pos);
+                    }
+                }
+                scanner.finish(pos);
+            }
+
+            if (scanner.headerFailed || scanner.headerBytes == null) {
+                log.warn("[GTFS-Index] Colonna trip_id non trovata nell'header di {}: indice offset non disponibile", stopTimesPath);
+                return StopTimesOffsetIndex.EMPTY;
+            }
+
+            if (Files.size(stopTimesPath) != fileSize || Files.getLastModifiedTime(stopTimesPath).toMillis() != lastModifiedMillis) {
+                log.warn("[GTFS-Index] stop_times.txt modificato durante la scansione: indice offset non disponibile");
+                return StopTimesOffsetIndex.EMPTY;
+            }
+
+            StopTimesOffsetIndex built = new StopTimesOffsetIndex(
+                    scanner.headerBytes,
+                    Map.copyOf(scanner.ranges),
+                    fileSize,
+                    lastModifiedMillis
+            );
+            long ms = (System.nanoTime() - t0) / 1_000_000;
+            log.info("[GTFS-Index] Indice offset stop_times costruito: trips={} ranges={} in {} ms",
+                    built.rangesByTripId().size(), scanner.rangeCount, ms);
+            return built;
+        } catch (IOException e) {
+            log.error("[GTFS-Index] Errore costruendo indice offset stop_times: {}", e.toString());
+            return StopTimesOffsetIndex.EMPTY;
+        }
+    }
+
+    private static int findTripIdColumn(byte[] headerBytes) {
+        CsvParserSettings s = new CsvParserSettings();
+        s.setHeaderExtractionEnabled(false);
+        s.setLineSeparatorDetectionEnabled(true);
+        s.setNullValue("");
+        s.setEmptyValue("");
+        s.getFormat().setDelimiter(',');
+        s.setMaxCharsPerColumn(1 << 14);
+        s.setErrorContentLength(120);
+        List<String[]> rows = new CsvParser(s).parseAll(
+                new InputStreamReader(new ByteArrayInputStream(headerBytes), StandardCharsets.UTF_8));
+        if (rows.isEmpty() || rows.getFirst() == null) {
+            return -1;
+        }
+        String[] header = rows.getFirst();
+        for (int i = 0; i < header.length; i++) {
+            String h = header[i];
+            if (h == null) continue;
+            if (!h.isEmpty() && h.charAt(0) == '\uFEFF') {
+                h = h.substring(1);
+            }
+            if ("trip_id".equals(h.trim())) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     private Set<String> activeServiceIdsOn(LocalDate serviceDate, Indexes indexes) {
@@ -1101,6 +1244,170 @@ public class GtfsIndexService {
     private static final class MutableTripWindow {
         private int min = Integer.MAX_VALUE;
         private int max = Integer.MIN_VALUE;
+    }
+
+    private record StopTimeRow(
+            String stopId,
+            Integer arrivalTimeSeconds,
+            Integer departureTimeSeconds
+    ) {}
+
+    /**
+     * Mappa trip_id -> byte-range [start, end) delle sue righe in stop_times.txt
+     * (coppie consecutive nell'array; di norma una sola coppia perche' le righe di un
+     * trip sono contigue nel feed). L'header e' conservato verbatim per riparsare i
+     * range con lo stesso parser CSV del percorso completo. size/mtime del file al
+     * momento della scansione permettono di rilevare un indice stale.
+     */
+    private record StopTimesOffsetIndex(
+            byte[] headerBytes,
+            Map<String, long[]> rangesByTripId,
+            long fileSize,
+            long fileLastModifiedMillis
+    ) {
+        private static final StopTimesOffsetIndex EMPTY = new StopTimesOffsetIndex(new byte[0], Map.of(), -1L, -1L);
+
+        private boolean isUsableFor(Path stopTimesPath) {
+            if (fileSize < 0) {
+                return false;
+            }
+            try {
+                return Files.size(stopTimesPath) == fileSize
+                        && Files.getLastModifiedTime(stopTimesPath).toMillis() == fileLastModifiedMillis;
+            } catch (IOException e) {
+                return false;
+            }
+        }
+    }
+
+    /**
+     * Scanner byte-level di stop_times.txt: individua i confini dei record rispettando le
+     * quote CSV (incluse le quote escapate "" e i newline dentro campi quotati) ed estrae
+     * il solo campo trip_id, senza materializzare le righe. Le stringhe trip_id vengono
+     * canonicalizzate riusando quelle gia' presenti nell'indice trips per non duplicarle.
+     */
+    private static final class StopTimesOffsetScanner {
+        private final Map<String, Trip> trips;
+        private final Map<String, long[]> ranges = new HashMap<>(262_144);
+        private final ByteArrayOutputStream headerBuf = new ByteArrayOutputStream(256);
+        private byte[] headerBytes;
+        private int tripIdCol = -1;
+        private boolean headerFailed;
+        private long rangeCount;
+
+        private byte[] field = new byte[64];
+        private int fieldLen;
+        private long recordStart;
+        private int fieldIndex;
+        private boolean inQuotes;
+        private boolean quotePending;
+        private boolean atFieldStart = true;
+        private String currentTripId;
+
+        private StopTimesOffsetScanner(Map<String, Trip> trips) {
+            this.trips = trips;
+        }
+
+        private void accept(byte b, long pos) {
+            if (headerBytes == null) {
+                headerBuf.write(b);
+            }
+            if (quotePending) {
+                quotePending = false;
+                if (b == '"') {
+                    appendIfCapturing((byte) '"');
+                    return;
+                }
+                inQuotes = false;
+            }
+            if (inQuotes) {
+                if (b == '"') {
+                    quotePending = true;
+                } else {
+                    appendIfCapturing(b);
+                }
+                return;
+            }
+            if (b == '"' && atFieldStart) {
+                inQuotes = true;
+                atFieldStart = false;
+                return;
+            }
+            if (b == ',') {
+                endField();
+                fieldIndex++;
+                atFieldStart = true;
+                return;
+            }
+            if (b == '\n') {
+                endField();
+                endRecord(pos + 1);
+                return;
+            }
+            if (b == '\r') {
+                return;
+            }
+            atFieldStart = false;
+            appendIfCapturing(b);
+        }
+
+        private void finish(long fileEnd) {
+            if (headerFailed || recordStart >= fileEnd) {
+                return;
+            }
+            endField();
+            endRecord(fileEnd);
+        }
+
+        private void appendIfCapturing(byte b) {
+            if (headerBytes == null || fieldIndex != tripIdCol || currentTripId != null || fieldLen >= MAX_TRIP_ID_BYTES) {
+                return;
+            }
+            if (fieldLen == field.length) {
+                field = Arrays.copyOf(field, field.length * 2);
+            }
+            field[fieldLen++] = b;
+        }
+
+        private void endField() {
+            if (headerBytes != null && fieldIndex == tripIdCol && currentTripId == null) {
+                currentTripId = new String(field, 0, fieldLen, StandardCharsets.UTF_8).trim();
+                fieldLen = 0;
+            }
+        }
+
+        private void endRecord(long recordEnd) {
+            if (headerBytes == null) {
+                headerBytes = headerBuf.toByteArray();
+                tripIdCol = findTripIdColumn(headerBytes);
+                if (tripIdCol < 0) {
+                    headerFailed = true;
+                }
+            } else if (currentTripId != null && !currentTripId.isEmpty()) {
+                Trip known = trips.get(currentTripId);
+                String key = known != null ? known.tripId() : currentTripId;
+                long[] existing = ranges.get(key);
+                if (existing == null) {
+                    ranges.put(key, new long[]{recordStart, recordEnd});
+                    rangeCount++;
+                } else if (existing[existing.length - 1] == recordStart) {
+                    existing[existing.length - 1] = recordEnd;
+                } else {
+                    long[] grown = Arrays.copyOf(existing, existing.length + 2);
+                    grown[grown.length - 2] = recordStart;
+                    grown[grown.length - 1] = recordEnd;
+                    ranges.put(key, grown);
+                    rangeCount++;
+                }
+            }
+            recordStart = recordEnd;
+            fieldIndex = 0;
+            atFieldStart = true;
+            currentTripId = null;
+            fieldLen = 0;
+            inQuotes = false;
+            quotePending = false;
+        }
     }
 
     public record SimulatedTrip(
