@@ -6,8 +6,10 @@ import com.univocity.parsers.csv.CsvParser;
 import com.univocity.parsers.csv.CsvParserSettings;
 import it.roma.gtfs.gtfs_monitor.config.GtfsProperties;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.BufferedInputStream;
@@ -27,6 +29,10 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 @Slf4j
@@ -45,9 +51,78 @@ public class GtfsIndexService {
     private Path dataDir;
 
     private final AtomicReference<Indexes> ref = new AtomicReference<>(Indexes.EMPTY);
+
+    /**
+     * Quando gli indici sono stati ricostruiti l'ultima volta.
+     *
+     * Serve come "versione" dei dati statici: usarla come `generatedAt` al posto
+     * di `Instant.now()` rende stabile l'ETag degli endpoint quasi statici, che
+     * altrimenti cambia a ogni richiesta e non produce mai un 304.
+     */
+    private final AtomicReference<Instant> dataVersion = new AtomicReference<>(Instant.EPOCH);
+
+    /** Istante dell'ultima ricostruzione degli indici. */
+    public Instant dataVersion() {
+        return dataVersion.get();
+    }
+
+    /**
+     * Il feed statico e' stato caricato almeno una volta?
+     *
+     * Serve a non rispondere "questa fermata non esiste" mentre gli indici sono
+     * ancora vuoti: il refresh di startup gira in background e per qualche decina
+     * di secondi il server accetta richieste con il catalogo a zero. In quella
+     * finestra un 404 e' una bugia — e un client che ripulisce i preferiti sui 404
+     * cancellerebbe fermate perfettamente valide. Meglio un 503 temporaneo.
+     */
+    public boolean isStaticDataLoaded() {
+        Indexes indexes = ref.get();
+        return !indexes.stops().isEmpty() && !indexes.trips().isEmpty();
+    }
     private final AtomicReference<Map<LocalDate, ScheduledStopIndex>> scheduledByDateRef = new AtomicReference<>(Map.of());
     private final AtomicReference<Map<LocalDate, ActiveTripIndex>> activeTripsByDateRef = new AtomicReference<>(Map.of());
     private final AtomicReference<StopTimesOffsetIndex> stopTimesOffsetsRef = new AtomicReference<>(StopTimesOffsetIndex.EMPTY);
+
+    /** Unico lock dei due indici per-data: ora nascono dalla stessa scansione. */
+    private final Object perDateIndexLock = new Object();
+
+    /**
+     * Contatore dei rebuild. Un warm-up in coda che si accorge di appartenere a una
+     * generazione superata si ferma invece di scaldare indici gia' invalidati.
+     */
+    private final AtomicLong rebuildGeneration = new AtomicLong();
+
+    /**
+     * Scalda gli indici per-data in background a fine rebuild.
+     *
+     * Senza, il primo utente dopo ogni ricostruzione (due volte al giorno, piu' lo
+     * startup) paga la scansione di stop_times.txt sul proprio thread: misurati
+     * 2,8 s su /nearby e 5,2 s su /vehicles?linea=X, contro ~100 ms a caldo.
+     * Mettere a false per tornare al comportamento pigro.
+     */
+    @Value("${gtfs.index.warmup.enabled:true}")
+    private boolean warmupEnabled = true;
+
+    /**
+     * Quanti giorni scaldare a partire da oggi. 2 = oggi e domani: domani non e' un
+     * lusso, e' la data che /vehicles?linea=X interroga di suo quando le corse di
+     * oggi non bastano, e quella che gli arrivi usano a cavallo della mezzanotte.
+     * Ogni giorno in piu' costa una scansione e qualche decina di MB di heap: alzare
+     * questo numero senza misurare l'heap e' un ottimo modo per far morire il
+     * processo sui 768 MB del container di produzione.
+     */
+    @Value("${gtfs.index.warmup.days:2}")
+    private int warmupDays = 2;
+
+    /**
+     * Il warm-up gira qui e non sul thread del refresh: il rebuild deve poter
+     * chiudere lo swap atomico dei file senza aspettare che gli indici siano caldi.
+     */
+    private final ExecutorService warmupExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "gtfs-index-warmup");
+        t.setDaemon(true);
+        return t;
+    });
 
     @PostConstruct
     void init() {
@@ -85,9 +160,18 @@ public class GtfsIndexService {
                 calendarDates.addedByDate(),
                 calendarDates.removedByDate()
         ));
+        dataVersion.set(Instant.now());
         stopTimesOffsetsRef.set(stopTimesOffsets);
-        scheduledByDateRef.set(Map.of());
-        activeTripsByDateRef.set(Map.of());
+
+        // Invalidazione sotto lo stesso lock della costruzione: un warm-up partito
+        // prima puo' cosi' solo finire e farsi buttare via, mai reinserire un indice
+        // costruito sul feed vecchio dopo che le cache sono state svuotate.
+        long generation;
+        synchronized (perDateIndexLock) {
+            scheduledByDateRef.set(Map.of());
+            activeTripsByDateRef.set(Map.of());
+            generation = rebuildGeneration.incrementAndGet();
+        }
 
         long ms = (System.nanoTime() - t0) / 1_000_000;
         log.info("[GTFS-Index] Indici ricostruiti: stops={} trips={} routes={} in {} ms",
@@ -96,6 +180,49 @@ public class GtfsIndexService {
         if (trips.isEmpty()) {
             log.warn("[GTFS-Index] ATTENZIONE: trips e' vuoto. Trip headsign e shape non funzioneranno.");
         }
+
+        scheduleWarmup(generation);
+    }
+
+    /**
+     * Accoda il warm-up degli indici per-data. Non blocca: chi ha chiamato
+     * {@link #rebuildIndexes()} torna subito e il primo utente non paga la scansione.
+     */
+    private void scheduleWarmup(long generation) {
+        if (!warmupEnabled || warmupDays <= 0) {
+            return;
+        }
+        try {
+            warmupExecutor.execute(() -> warmUpPerDateIndexes(generation));
+        } catch (RejectedExecutionException e) {
+            log.debug("[GTFS-Index] Warm-up non avviato: executor gia' chiuso");
+        }
+    }
+
+    private void warmUpPerDateIndexes(long generation) {
+        LocalDate today = LocalDate.now(ROME_ZONE);
+        long t0 = System.nanoTime();
+        for (int offset = 0; offset < warmupDays; offset++) {
+            if (generation != rebuildGeneration.get()) {
+                log.info("[GTFS-Index] Warm-up interrotto: e' arrivato un rebuild piu' recente");
+                return;
+            }
+            LocalDate date = today.plusDays(offset);
+            try {
+                perDateIndexes(date);
+            } catch (RuntimeException e) {
+                // Un warm-up fallito degrada la latenza, non la correttezza: la
+                // costruzione pigra resta come rete di sicurezza.
+                log.warn("[GTFS-Index] Warm-up fallito per {}: {}", date, e.toString());
+            }
+        }
+        log.info("[GTFS-Index] Warm-up indici per-data completato ({} giorni) in {} ms",
+                warmupDays, (System.nanoTime() - t0) / 1_000_000);
+    }
+
+    @PreDestroy
+    void shutdownWarmup() {
+        warmupExecutor.shutdownNow();
     }
 
     public Optional<Stop> stopById(String id) {
@@ -180,6 +307,41 @@ public class GtfsIndexService {
         Trip trip = tripByIdOrNull(tripId);
         if (trip == null || trip.shapeId() == null || trip.shapeId().isBlank()) return List.of();
         return ref.get().shapesById().getOrDefault(trip.shapeId(), List.of());
+    }
+
+    /**
+     * Linee servite da una fermata nella giornata di servizio indicata.
+     *
+     * Diverso dagli arrivi: qui non c'e' filtro temporale. Serve per dire "questa
+     * fermata e' servita dalle linee X, Y, Z" anche di notte o quando non ci sono
+     * corse in arrivo — per esempio per segnalare gli avvisi di servizio, che
+     * altrimenti sparirebbero proprio nelle ore in cui il servizio e' ridotto.
+     *
+     * Riusa l'indice per-data gia' costruito: nessuna scansione aggiuntiva.
+     */
+    public List<String> linesServingStop(String stopId, LocalDate serviceDate) {
+        if (stopId == null || stopId.isBlank()) {
+            return List.of();
+        }
+        Indexes indexes = ref.get();
+        List<ScheduledStopTime> stopTimes = scheduledStopIndexForDate(serviceDate).byStopId().get(stopId);
+        if (stopTimes == null || stopTimes.isEmpty()) {
+            return List.of();
+        }
+
+        // LinkedHashSet: niente duplicati, ordine di prima apparizione stabile.
+        Set<String> lines = new LinkedHashSet<>();
+        for (ScheduledStopTime stopTime : stopTimes) {
+            Trip trip = indexes.trips().get(stopTime.tripId());
+            if (trip == null) {
+                continue;
+            }
+            String line = publicLineByRouteId(trip.routeId());
+            if (line != null && !line.isBlank()) {
+                lines.add(line);
+            }
+        }
+        return List.copyOf(lines);
     }
 
     public List<ScheduledArrival> scheduledArrivalsForStop(String stopId, Instant now, int horizonMinutes, int limit) {
@@ -556,39 +718,76 @@ public class GtfsIndexService {
     }
 
     private ScheduledStopIndex scheduledStopIndexForDate(LocalDate serviceDate) {
-        Map<LocalDate, ScheduledStopIndex> current = scheduledByDateRef.get();
-        ScheduledStopIndex cached = current.get(serviceDate);
-        if (cached != null) {
-            return cached;
+        return perDateIndexes(serviceDate).scheduled();
+    }
+
+    private ActiveTripIndex activeTripIndexForDate(LocalDate serviceDate) {
+        return perDateIndexes(serviceDate).activeTrips();
+    }
+
+    /**
+     * Indici per-data, costruiti insieme alla prima richiesta che ne ha bisogno.
+     *
+     * Prima erano due cache indipendenti, con lock separati e due scansioni distinte
+     * degli stessi 240 MB di stop_times.txt: chi chiedeva gli arrivi pagava una
+     * passata, chi chiedeva le corse simulate ne pagava un'altra identica. Ora la
+     * passata e' una sola e serve entrambi — vedi {@link #buildPerDateIndexes}.
+     *
+     * Il lock unico e' la conseguenza necessaria: due lock su un'unica costruzione
+     * non proteggerebbero nulla.
+     */
+    private PerDateIndexes perDateIndexes(LocalDate serviceDate) {
+        ScheduledStopIndex scheduled = scheduledByDateRef.get().get(serviceDate);
+        ActiveTripIndex activeTrips = activeTripsByDateRef.get().get(serviceDate);
+        if (scheduled != null && activeTrips != null) {
+            return new PerDateIndexes(scheduled, activeTrips);
         }
 
-        synchronized (scheduledByDateRef) {
-            current = scheduledByDateRef.get();
-            cached = current.get(serviceDate);
-            if (cached != null) {
-                return cached;
+        synchronized (perDateIndexLock) {
+            scheduled = scheduledByDateRef.get().get(serviceDate);
+            activeTrips = activeTripsByDateRef.get().get(serviceDate);
+            if (scheduled != null && activeTrips != null) {
+                return new PerDateIndexes(scheduled, activeTrips);
             }
 
-            ScheduledStopIndex built = buildScheduledStopIndex(serviceDate);
-            Map<LocalDate, ScheduledStopIndex> next = new HashMap<>();
-            for (Map.Entry<LocalDate, ScheduledStopIndex> entry : current.entrySet()) {
-                LocalDate date = entry.getKey();
-                if (!date.isBefore(serviceDate.minusDays(1)) && !date.isAfter(serviceDate.plusDays(1))) {
-                    next.put(date, entry.getValue());
-                }
-            }
-            next.put(serviceDate, built);
-            scheduledByDateRef.set(Map.copyOf(next));
+            PerDateIndexes built = buildPerDateIndexes(serviceDate);
+            scheduledByDateRef.set(withDate(scheduledByDateRef.get(), serviceDate, built.scheduled()));
+            activeTripsByDateRef.set(withDate(activeTripsByDateRef.get(), serviceDate, built.activeTrips()));
             return built;
         }
     }
 
-    private ScheduledStopIndex buildScheduledStopIndex(LocalDate serviceDate) {
+    /**
+     * Inserisce l'indice della data tenendo in cache solo il giorno prima e il giorno
+     * dopo: oltre non serve a nessuno e ogni data costa decine di MB.
+     */
+    private static <V> Map<LocalDate, V> withDate(Map<LocalDate, V> current, LocalDate serviceDate, V built) {
+        Map<LocalDate, V> next = new HashMap<>();
+        for (Map.Entry<LocalDate, V> entry : current.entrySet()) {
+            LocalDate date = entry.getKey();
+            if (!date.isBefore(serviceDate.minusDays(1)) && !date.isAfter(serviceDate.plusDays(1))) {
+                next.put(date, entry.getValue());
+            }
+        }
+        next.put(serviceDate, built);
+        return Map.copyOf(next);
+    }
+
+    /**
+     * Una sola scansione di stop_times.txt per costruire entrambi gli indici della data.
+     *
+     * I due indici guardano le stesse righe da due angoli diversi — "quali corse passano
+     * da questa fermata e quando" e "in che finestra oraria e' attiva questa corsa" — e
+     * fino a ieri se le rileggevano a testa. Le regole di scarto restano quelle di prima,
+     * separate per indice: una riga senza stop_id contribuisce comunque alla finestra
+     * della corsa, come faceva la vecchia buildActiveTripIndex.
+     */
+    private PerDateIndexes buildPerDateIndexes(LocalDate serviceDate) {
         long t0 = System.nanoTime();
         Indexes indexes = ref.get();
         Set<String> activeServiceIds = activeServiceIdsOn(serviceDate, indexes);
         if (activeServiceIds.isEmpty()) {
-            return ScheduledStopIndex.EMPTY;
+            return PerDateIndexes.EMPTY;
         }
 
         Set<String> activeTripIds = new HashSet<>();
@@ -598,16 +797,17 @@ public class GtfsIndexService {
             }
         }
         if (activeTripIds.isEmpty()) {
-            return ScheduledStopIndex.EMPTY;
+            return PerDateIndexes.EMPTY;
         }
 
         Path stopTimesPath = dataDir.resolve("stop_times.txt");
         if (!Files.exists(stopTimesPath)) {
             log.warn("[GTFS-Index] stop_times.txt non trovato in {}", stopTimesPath);
-            return ScheduledStopIndex.EMPTY;
+            return PerDateIndexes.EMPTY;
         }
 
         Map<String, List<ScheduledStopTime>> byStopId = new HashMap<>();
+        Map<String, MutableTripWindow> windows = new HashMap<>();
         try (InputStream is = new BufferedInputStream(Files.newInputStream(stopTimesPath))) {
             CsvParser parser = newParser();
             parser.beginParsing(is, StandardCharsets.UTF_8);
@@ -616,19 +816,29 @@ public class GtfsIndexService {
                 String tripId = r.getString("trip_id");
                 if (tripId == null || !activeTripIds.contains(tripId)) continue;
 
-                String stopId = r.getString("stop_id");
-                if (stopId == null || stopId.isBlank()) continue;
-
                 Integer arrivalTimeSeconds = parseGtfsTimeToSeconds(r.getString("arrival_time"));
                 Integer departureTimeSeconds = parseGtfsTimeToSeconds(r.getString("departure_time"));
                 Integer bestTimeSeconds = arrivalTimeSeconds != null ? arrivalTimeSeconds : departureTimeSeconds;
                 if (bestTimeSeconds == null) continue;
 
+                // Il parser crea una String nuova per ogni riga: tenerla significherebbe
+                // ~940.000 copie di id gia' residenti in memoria, per data. Si riusa
+                // l'istanza gia' in trips.txt — stesso valore, un oggetto invece di un milione.
                 Trip trip = indexes.trips().get(tripId);
+                String canonicalTripId = trip != null ? trip.tripId() : tripId;
+
+                // Finestra di attivita' della corsa: non dipende dalla fermata.
+                MutableTripWindow window = windows.computeIfAbsent(canonicalTripId, ignored -> new MutableTripWindow());
+                window.min = Math.min(window.min, bestTimeSeconds);
+                window.max = Math.max(window.max, departureTimeSeconds != null ? departureTimeSeconds : bestTimeSeconds);
+
+                // Indice per fermata: qui servono stop_id valorizzato e corsa nota.
+                String stopId = r.getString("stop_id");
+                if (stopId == null || stopId.isBlank()) continue;
                 if (trip == null) continue;
 
                 byStopId.computeIfAbsent(stopId, ignored -> new ArrayList<>(8)).add(new ScheduledStopTime(
-                        tripId,
+                        canonicalTripId,
                         arrivalTimeSeconds != null ? arrivalTimeSeconds : -1,
                         departureTimeSeconds != null ? departureTimeSeconds : -1,
                         bestTimeSeconds
@@ -636,18 +846,27 @@ public class GtfsIndexService {
             }
             parser.stopParsing();
         } catch (IOException e) {
-            log.error("[GTFS-Index] Errore costruendo indice stop_times per {}: {}", serviceDate, e.toString());
-            return ScheduledStopIndex.EMPTY;
+            log.error("[GTFS-Index] Errore costruendo gli indici per-data {}: {}", serviceDate, e.toString());
+            return PerDateIndexes.EMPTY;
         }
 
         for (List<ScheduledStopTime> entries : byStopId.values()) {
             entries.sort(Comparator.comparingInt(ScheduledStopTime::bestTimeSeconds));
         }
 
+        Map<String, ActiveTripSchedule> byTripId = new HashMap<>(Math.max(16, windows.size()));
+        for (Map.Entry<String, MutableTripWindow> entry : windows.entrySet()) {
+            if (entry.getValue().min == Integer.MAX_VALUE || entry.getValue().max == Integer.MIN_VALUE) continue;
+            byTripId.put(entry.getKey(), new ActiveTripSchedule(entry.getKey(), entry.getValue().min, entry.getValue().max));
+        }
+
         long ms = (System.nanoTime() - t0) / 1_000_000;
-        log.info("[GTFS-Index] Indice orari programmati costruito per {}: services={} trips={} stops={} in {} ms",
-                serviceDate, activeServiceIds.size(), activeTripIds.size(), byStopId.size(), ms);
-        return new ScheduledStopIndex(serviceDate, freezeListMap(byStopId));
+        log.info("[GTFS-Index] Indici per-data costruiti per {}: services={} trips={} stops={} corse-attive={} in {} ms",
+                serviceDate, activeServiceIds.size(), activeTripIds.size(), byStopId.size(), byTripId.size(), ms);
+        return new PerDateIndexes(
+                new ScheduledStopIndex(serviceDate, freezeListMap(byStopId)),
+                new ActiveTripIndex(serviceDate, Map.copyOf(byTripId))
+        );
     }
 
     private void collectSimulatedTrips(
@@ -725,92 +944,6 @@ public class GtfsIndexService {
                 shape,
                 wheelchairAccessible(trip.wheelchair())
         ));
-    }
-
-    private ActiveTripIndex activeTripIndexForDate(LocalDate serviceDate) {
-        Map<LocalDate, ActiveTripIndex> current = activeTripsByDateRef.get();
-        ActiveTripIndex cached = current.get(serviceDate);
-        if (cached != null) {
-            return cached;
-        }
-
-        synchronized (activeTripsByDateRef) {
-            current = activeTripsByDateRef.get();
-            cached = current.get(serviceDate);
-            if (cached != null) {
-                return cached;
-            }
-
-            ActiveTripIndex built = buildActiveTripIndex(serviceDate);
-            Map<LocalDate, ActiveTripIndex> next = new HashMap<>();
-            for (Map.Entry<LocalDate, ActiveTripIndex> entry : current.entrySet()) {
-                LocalDate date = entry.getKey();
-                if (!date.isBefore(serviceDate.minusDays(1)) && !date.isAfter(serviceDate.plusDays(1))) {
-                    next.put(date, entry.getValue());
-                }
-            }
-            next.put(serviceDate, built);
-            activeTripsByDateRef.set(Map.copyOf(next));
-            return built;
-        }
-    }
-
-    private ActiveTripIndex buildActiveTripIndex(LocalDate serviceDate) {
-        long t0 = System.nanoTime();
-        Indexes indexes = ref.get();
-        Set<String> activeServiceIds = activeServiceIdsOn(serviceDate, indexes);
-        if (activeServiceIds.isEmpty()) {
-            return ActiveTripIndex.EMPTY;
-        }
-
-        Set<String> activeTripIds = new HashSet<>();
-        for (Trip trip : indexes.trips().values()) {
-            if (trip.serviceId() != null && activeServiceIds.contains(trip.serviceId())) {
-                activeTripIds.add(trip.tripId());
-            }
-        }
-        if (activeTripIds.isEmpty()) {
-            return ActiveTripIndex.EMPTY;
-        }
-
-        Path stopTimesPath = dataDir.resolve("stop_times.txt");
-        if (!Files.exists(stopTimesPath)) {
-            return ActiveTripIndex.EMPTY;
-        }
-
-        Map<String, MutableTripWindow> windows = new HashMap<>();
-        try (InputStream is = new BufferedInputStream(Files.newInputStream(stopTimesPath))) {
-            CsvParser parser = newParser();
-            parser.beginParsing(is, StandardCharsets.UTF_8);
-            Record r;
-            while ((r = parser.parseNextRecord()) != null) {
-                String tripId = r.getString("trip_id");
-                if (tripId == null || !activeTripIds.contains(tripId)) continue;
-
-                Integer arrival = parseGtfsTimeToSeconds(r.getString("arrival_time"));
-                Integer departure = parseGtfsTimeToSeconds(r.getString("departure_time"));
-                Integer best = arrival != null ? arrival : departure;
-                if (best == null) continue;
-
-                MutableTripWindow window = windows.computeIfAbsent(tripId, ignored -> new MutableTripWindow());
-                window.min = Math.min(window.min, best);
-                window.max = Math.max(window.max, departure != null ? departure : best);
-            }
-            parser.stopParsing();
-        } catch (IOException e) {
-            log.error("[GTFS-Index] Errore costruendo indice trip attivi per {}: {}", serviceDate, e.toString());
-            return ActiveTripIndex.EMPTY;
-        }
-
-        Map<String, ActiveTripSchedule> byTripId = new HashMap<>();
-        for (Map.Entry<String, MutableTripWindow> entry : windows.entrySet()) {
-            if (entry.getValue().min == Integer.MAX_VALUE || entry.getValue().max == Integer.MIN_VALUE) continue;
-            byTripId.put(entry.getKey(), new ActiveTripSchedule(entry.getKey(), entry.getValue().min, entry.getValue().max));
-        }
-
-        long ms = (System.nanoTime() - t0) / 1_000_000;
-        log.info("[GTFS-Index] Indice trip attivi costruito per {}: trips={} in {} ms", serviceDate, byTripId.size(), ms);
-        return new ActiveTripIndex(serviceDate, Map.copyOf(byTripId));
     }
 
     private List<ScheduledTripStop> scheduledNextStopsForTripOnDate(Trip trip, LocalDate serviceDate, long nowEpochSeconds, int limit) {
@@ -1240,6 +1373,15 @@ public class GtfsIndexService {
             int startTimeSeconds,
             int endTimeSeconds
     ) {}
+
+    /** I due indici di una data, prodotti insieme da una sola lettura di stop_times.txt. */
+    private record PerDateIndexes(
+            ScheduledStopIndex scheduled,
+            ActiveTripIndex activeTrips
+    ) {
+        private static final PerDateIndexes EMPTY =
+                new PerDateIndexes(ScheduledStopIndex.EMPTY, ActiveTripIndex.EMPTY);
+    }
 
     private static final class MutableTripWindow {
         private int min = Integer.MAX_VALUE;

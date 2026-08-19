@@ -1,5 +1,6 @@
 package it.roma.gtfs.gtfs_monitor.service;
 
+import it.roma.gtfs.gtfs_monitor.config.ResourceNotFoundException;
 import it.roma.gtfs.gtfs_monitor.model.dto.ApiStopSearchItemDTO;
 import it.roma.gtfs.gtfs_monitor.model.dto.NearbyArrivalDTO;
 import it.roma.gtfs.gtfs_monitor.model.dto.NearbyResponseDTO;
@@ -11,6 +12,8 @@ import org.springframework.stereotype.Service;
 
 import java.text.Normalizer;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
@@ -19,6 +22,8 @@ import java.util.stream.Collectors;
 @Service
 @RequiredArgsConstructor
 public class NearbyService {
+
+    private static final ZoneId ROME_ZONE = ZoneId.of("Europe/Rome");
     private static final DateTimeFormatter ROME_TS = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z");
 
     private final GtfsIndexService gtfsIndexService;
@@ -76,13 +81,23 @@ public class NearbyService {
                 .toList();
     }
 
+    /**
+     * Arrivi a una fermata.
+     *
+     * @throws ResourceNotFoundException se la fermata non esiste nel feed caricato.
+     *         Prima si restituiva un 200 con nome fittizio "Fermata non trovata": il
+     *         client non poteva distinguere un id sbagliato da una fermata vera senza
+     *         corse in arrivo, e finiva per mostrare una fermata inesistente come se
+     *         fosse solo momentaneamente vuota. Una fermata che esiste ma non ha
+     *         arrivi resta 200 con {@code arrivals} vuoto.
+     */
     public NearbyStopDTO stopArrivals(String stopId, Integer limitArrivalsPerStop) {
         if (stopId == null || stopId.isBlank()) {
-            return new NearbyStopDTO(stopId, "Fermata non trovata", null, null, null, null, List.of());
+            throw new IllegalArgumentException("stopId: obbligatorio");
         }
         GtfsIndexService.Stop stop = gtfsIndexService.stopByIdOrNull(stopId);
         if (stop == null) {
-            return new NearbyStopDTO(stopId, "Fermata non trovata", null, null, null, null, List.of());
+            throw ResourceNotFoundException.stop(stopId);
         }
 
         int arrivalsLimit = limitArrivalsPerStop == null || limitArrivalsPerStop <= 0 ? 8 : Math.min(limitArrivalsPerStop, 12);
@@ -156,6 +171,12 @@ public class NearbyService {
                 .toList();
         List<NearbyArrivalDTO> arrivals = mergeArrivals(liveArrivals, scheduledArrivals, arrivalsLimit);
 
+        // Le linee servite non dipendono dagli arrivi del momento: di notte gli
+        // arrivi sono vuoti ma la fermata resta servita da quelle linee (e i
+        // relativi avvisi di servizio vanno mostrati comunque).
+        List<String> servedLines = gtfsIndexService.linesServingStop(
+                sd.stop.id(), LocalDate.now(ROME_ZONE));
+
         return new NearbyStopDTO(
                 sd.stop.id(),
                 sd.stop.name(),
@@ -163,6 +184,7 @@ public class NearbyService {
                 sd.stop.lon() != null ? sd.stop.lon().doubleValue() : null,
                 includeDistance ? sd.distanceMeters : null,
                 includeDistance ? Math.max(1, (int) Math.round(sd.distanceMeters / 80.0)) : null,
+                servedLines,
                 arrivals
         );
     }

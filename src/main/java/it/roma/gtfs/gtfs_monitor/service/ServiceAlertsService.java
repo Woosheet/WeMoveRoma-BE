@@ -202,6 +202,12 @@ public class ServiceAlertsService {
             if (id == null || id.isBlank()) continue;
             if (!sentThisCycle.add(id)) continue;
 
+            // NB: qui si guarda la severita' DICHIARATA dal feed, non quella derivata
+            // dall'effetto che l'API di lettura espone (AlertSeverityResolver).
+            // Il feed di Roma non dichiara mai la severita', quindi oggi questo filtro
+            // blocca tutto: e' voluto. Usare la severita' derivata renderebbe
+            // notificabili 112 avvisi su 115 — quasi tutti deviazioni per lavori —
+            // cioe' spam. Allargare le push e' una decisione a se', con criteri suoi.
             if (!wanted.isEmpty() && (dto.getSeverita() == null || !wanted.contains(dto.getSeverita().toUpperCase(Locale.ROOT)))) {
                 continue;
             }
@@ -347,8 +353,10 @@ public class ServiceAlertsService {
                 List<String> tripIds = trips.isEmpty() ? null : List.copyOf(trips);
                 List<String> stopIds = stops.isEmpty() ? null : List.copyOf(stops);
 
-                String effect = a.hasEffect() ? translateEffect(a.getEffect().name()) : null;
-                String cause  = a.hasCause()  ? translateCause(a.getCause().name())  : null;
+                String effectCode = a.hasEffect() ? a.getEffect().name() : null;
+                String causeCode  = a.hasCause()  ? a.getCause().name()  : null;
+                String effect = translateEffect(effectCode);
+                String cause  = translateCause(causeCode);
                 String sev    = a.hasSeverityLevel() ? a.getSeverityLevel().name() : null;
 
                 for (var pr : periods) {
@@ -365,6 +373,8 @@ public class ServiceAlertsService {
                             .severita(sev)
                             .causa(cause)
                             .effetto(effect)
+                            .causaCodice(causeCode)
+                            .effettoCodice(effectCode)
                             .routeIds(routeIds)
                             .tripIds(tripIds)
                             .stopIds(stopIds)
