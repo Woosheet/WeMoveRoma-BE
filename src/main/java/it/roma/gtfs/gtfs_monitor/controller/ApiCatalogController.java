@@ -1,13 +1,19 @@
 package it.roma.gtfs.gtfs_monitor.controller;
 
+import it.roma.gtfs.gtfs_monitor.config.ResourceNotFoundException;
+import it.roma.gtfs.gtfs_monitor.model.dto.ApiLinePatternDTO;
 import it.roma.gtfs.gtfs_monitor.service.GtfsIndexService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ResponseStatusException;
 
+import java.time.Instant;
 import java.util.Comparator;
 import java.util.List;
 
@@ -27,6 +33,39 @@ public class ApiCatalogController {
                 .toList();
         log.debug("GET /api/v1/catalog/lines -> {}", out.size());
         return out;
+    }
+
+    /**
+     * Percorso della linea: le fermate in ordine, una sequenza per direzione.
+     *
+     * Alimenta le pagine pubbliche per linea. Restituisce 404 se la linea non
+     * esiste nel feed: un elenco vuoto sarebbe indistinguibile da una linea
+     * reale senza corse attive.
+     */
+    @GetMapping("/lines/{line}/pattern")
+    public ApiLinePatternDTO linePattern(@PathVariable String line) {
+        // Con gli indici ancora vuoti nessuna linea esiste: 503, non 404 (stessa
+        // convenzione di ApiStopsController e ApiTripsController).
+        if (!gtfsIndexService.isStaticDataLoaded()) {
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                    "Dati GTFS non ancora caricati, riprovare tra qualche istante");
+        }
+        if (gtfsIndexService.routeIdsByPublicLine(line).isEmpty()) {
+            throw new ResourceNotFoundException("Linea", line);
+        }
+
+        List<ApiLinePatternDTO.ApiLineDirectionDTO> direzioni = gtfsIndexService.linePatterns(line).stream()
+                .map(p -> new ApiLinePatternDTO.ApiLineDirectionDTO(
+                        p.directionId(),
+                        p.headsign(),
+                        p.stops().size(),
+                        p.stops().stream()
+                                .map(s -> new ApiLinePatternDTO.ApiLineStopDTO(
+                                        s.stopId(), s.stopName(), s.lat(), s.lon()))
+                                .toList()))
+                .toList();
+        log.debug("GET /api/v1/catalog/lines/{}/pattern -> {} direzioni", line, direzioni.size());
+        return new ApiLinePatternDTO(line, gtfsIndexService.modeForLine(line), direzioni);
     }
 
     @GetMapping("/destinations")

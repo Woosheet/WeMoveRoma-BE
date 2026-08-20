@@ -141,6 +141,7 @@ public class GtfsIndexService {
 
         Map<String, Stop> stops = loadStops(stopsPath);
         Map<String, String> routeShortNames = loadRouteShortNames(routesPath);
+        Map<String, Integer> routeTypes = loadRouteTypes(routesPath);
         Map<String, Trip> trips = loadTrips(tripsPath);
         Map<String, List<ShapePoint>> shapesById = loadShapes(shapesPath, referencedShapeIds(trips));
         CalendarDatesIndex calendarDates = loadCalendarDates(calendarDatesPath);
@@ -155,6 +156,7 @@ public class GtfsIndexService {
                 byRoute,
                 destinationsByRoute,
                 routeShortNames,
+                routeTypes,
                 routeIdsByLine,
                 shapesById,
                 calendarDates.addedByDate(),
@@ -432,6 +434,90 @@ public class GtfsIndexService {
         return scheduledNextStopsForTripOnDate(trip, nowRome.toLocalDate().plusDays(1), now.getEpochSecond(), limit);
     }
 
+    /**
+     * Percorso di una linea: le fermate in ordine, una sequenza per direzione.
+     *
+     * Serve alle pagine pubbliche per linea, che hanno bisogno di contenuto vero
+     * (l'elenco delle fermate) e non solo di una mappa.
+     *
+     * Come viene scelto il percorso: una linea ha piu' corse al giorno, con
+     * percorsi che possono variare (deviazioni, corse limitate). Per ogni
+     * direzione si prende la corsa con PIU' fermate fra un campione, che e' il
+     * percorso completo; le corse limitate sono sottoinsiemi e non aggiungono
+     * informazione. Il campione evita di leggere centinaia di corse per linea.
+     */
+    /**
+     * Percorso "canonico" di una linea, una voce per direzione/capolinea.
+     * <p>Deliberatamente <b>indipendente dalla data</b>: serve a descrivere il tracciato della
+     * linea (pagine per linea, SEO), non le corse di oggi. Usare {@code scheduledStopsForTrip}
+     * qui sarebbe sbagliato: filtra per validita' del servizio e restituisce vuoto per tutte
+     * le linee le cui corse campionate non girano oggi (verificato sulla 160).
+     */
+    public List<LinePattern> linePatterns(String line) {
+        if (line == null || line.isBlank()) {
+            return List.of();
+        }
+        Indexes indexes = ref.get();
+        Map<String, LinePattern> perDirezione = new LinkedHashMap<>();
+
+        for (String routeId : routeIdsByPublicLine(line)) {
+            Map<String, List<String>> tripsPerDirezione = new LinkedHashMap<>();
+            for (String tripId : tripsByRoute(routeId)) {
+                Trip trip = indexes.trips().get(tripId);
+                if (trip == null) continue;
+                // Chiave: direzione + capolinea. Il solo directionId non basta,
+                // alcune linee hanno rami diversi nella stessa direzione.
+                String chiave = (trip.directionId() == null ? "?" : trip.directionId().toString())
+                        + "|" + (trip.headsign() == null ? "" : trip.headsign());
+                tripsPerDirezione.computeIfAbsent(chiave, k -> new ArrayList<>()).add(tripId);
+            }
+
+            for (Map.Entry<String, List<String>> entry : tripsPerDirezione.entrySet()) {
+                List<String> candidati = entry.getValue();
+                List<ScheduledTripStop> migliore = List.of();
+                String tripMigliore = null;
+                // Campionamento distribuito, non le prime N: le corse sono ordinate per
+                // service_id, quindi prendere la testa della lista significa guardare sempre
+                // lo stesso giorno-tipo. Le corse brevi (limitate) sono raggruppate, e la 160
+                // ha rami da 22 e da 37 fermate: solo spaziando si intercetta la piu' lunga.
+                int passo = Math.max(1, candidati.size() / LINE_PATTERN_SAMPLE);
+                for (int i = 0; i < candidati.size(); i += passo) {
+                    String tripId = candidati.get(i);
+                    Trip candidato = indexes.trips().get(tripId);
+                    if (candidato == null) continue;
+                    List<ScheduledTripStop> fermate = canonicalStopsForTrip(candidato);
+                    if (fermate.size() > migliore.size()) {
+                        migliore = fermate;
+                        tripMigliore = tripId;
+                    }
+                }
+                if (migliore.isEmpty()) continue;
+
+                Trip trip = indexes.trips().get(tripMigliore);
+                String capolinea = trip == null ? null : trip.headsign();
+                perDirezione.putIfAbsent(entry.getKey(), new LinePattern(
+                        line,
+                        routeId,
+                        trip == null ? null : trip.directionId(),
+                        capolinea,
+                        tripMigliore,
+                        migliore
+                ));
+            }
+        }
+        // Ordine stabile e leggibile: prima la direzione, poi la variante piu' lunga.
+        // Alcune linee hanno rami e corse limitate con lo stesso directionId (il tram 2
+        // ne ha tre): senza ordinamento in cima finirebbe una corsa parziale da 8 fermate.
+        return perDirezione.values().stream()
+                .sorted(Comparator
+                        .comparing((LinePattern p) -> p.directionId() == null ? Integer.MAX_VALUE : p.directionId())
+                        .thenComparing(p -> -p.stops().size()))
+                .toList();
+    }
+
+    /** Quante corse esaminare per direzione prima di scegliere il percorso piu' lungo. */
+    private static final int LINE_PATTERN_SAMPLE = 25;
+
     public List<ScheduledTripStop> scheduledStopsForTrip(String tripId, Instant when) {
         if (tripId == null || tripId.isBlank()) {
             return List.of();
@@ -578,6 +664,66 @@ public class GtfsIndexService {
             parser.stopParsing();
         }
         return out;
+    }
+
+    /** route_type per route_id (GTFS: 0 tram, 1 metro, 2 treno, 3 bus). */
+    private Map<String, Integer> loadRouteTypes(Path p) throws IOException {
+        Map<String, Integer> out = new HashMap<>();
+        if (!Files.exists(p)) {
+            return out;
+        }
+        try (InputStream is = new BufferedInputStream(Files.newInputStream(p))) {
+            CsvParser parser = newParser();
+            parser.beginParsing(is, StandardCharsets.UTF_8);
+            Record r;
+            Boolean colonnaPresente = null;
+            while ((r = parser.parseNextRecord()) != null) {
+                // route_type e' obbligatorio secondo la specifica GTFS, ma un feed
+                // che non ce l'ha non deve far fallire la costruzione dell'intero
+                // indice: senza la colonna, getString lancerebbe. Tutte le linee
+                // restano semplicemente senza modo, e il chiamante usa "bus".
+                if (colonnaPresente == null) {
+                    colonnaPresente = r.getMetaData().containsColumn("route_type");
+                    if (!colonnaPresente) {
+                        log.warn("[GTFS-Index] routes.txt senza colonna route_type: modo non disponibile");
+                        return out;
+                    }
+                }
+                String routeId = r.getString("route_id");
+                if (routeId == null || routeId.isBlank()) continue;
+                String tipo = r.getString("route_type");
+                if (tipo == null || tipo.isBlank()) continue;
+                try {
+                    out.put(routeId, Integer.parseInt(tipo.trim()));
+                } catch (NumberFormatException ignored) {
+                    // route_type non numerico: la linea resta senza modo, il chiamante usa il default
+                }
+            }
+            parser.stopParsing();
+        }
+        return out;
+    }
+
+    /**
+     * Modo di trasporto di una linea pubblica, in italiano e gia' pronto per l'uso
+     * editoriale ("metro", "tram", "treno", "bus"). Serve a non intitolare
+     * "Linea MEA" una pagina che ogni romano cerca come "metro A".
+     */
+    public String modeForLine(String line) {
+        Indexes indexes = ref.get();
+        for (String routeId : routeIdsByPublicLine(line)) {
+            Integer tipo = indexes.routeTypeByRouteId().get(routeId);
+            if (tipo == null) continue;
+            return switch (tipo) {
+                case 0, 5 -> "tram";
+                case 1 -> "metro";
+                case 2 -> "treno";
+                case 4 -> "traghetto";
+                case 6, 7 -> "funicolare";
+                default -> "bus";
+            };
+        }
+        return "bus";
     }
 
     private Map<String, List<ShapePoint>> loadShapes(Path p, Set<String> referencedShapeIds) throws IOException {
@@ -1009,6 +1155,40 @@ public class GtfsIndexService {
         return List.copyOf(out);
     }
 
+    /**
+     * Sequenza di fermate di una corsa <b>senza</b> il filtro di validita' del servizio,
+     * per descrivere il tracciato di una linea. Gli orari restano {@code null}: sono relativi
+     * a una data di servizio, che qui non esiste.
+     */
+    private List<ScheduledTripStop> canonicalStopsForTrip(Trip trip) {
+        Path stopTimesPath = dataDir.resolve("stop_times.txt");
+        if (!Files.exists(stopTimesPath)) {
+            return List.of();
+        }
+        List<StopTimeRow> rows;
+        try {
+            rows = stopTimeRowsForTrip(trip.tripId(), stopTimesPath);
+        } catch (IOException e) {
+            log.error("[GTFS-Index] Errore leggendo il percorso della corsa {}: {}", trip.tripId(), e.toString());
+            return List.of();
+        }
+        List<ScheduledTripStop> out = new ArrayList<>(rows.size());
+        for (StopTimeRow row : rows) {
+            Stop stop = stopByIdOrNull(row.stopId());
+            out.add(new ScheduledTripStop(
+                    row.stopId(),
+                    stop != null ? stop.name() : null,
+                    trip.tripId(),
+                    publicLineByRouteId(trip.routeId()),
+                    stop != null && stop.lat() != null ? stop.lat().doubleValue() : null,
+                    stop != null && stop.lon() != null ? stop.lon().doubleValue() : null,
+                    null,
+                    null
+            ));
+        }
+        return List.copyOf(out);
+    }
+
     private ScheduledTripStop toScheduledTripStop(Trip trip, StopTimeRow row, long serviceStartEpochSeconds) {
         Stop stop = stopByIdOrNull(row.stopId());
         return new ScheduledTripStop(
@@ -1290,12 +1470,13 @@ public class GtfsIndexService {
             Map<String, Set<String>> tripsByRoute,
             Map<String, Set<String>> destinationsByRoute,
             Map<String, String> routeShortNameByRouteId,
+            Map<String, Integer> routeTypeByRouteId,
             Map<String, Set<String>> routeIdsByPublicLine,
             Map<String, List<ShapePoint>> shapesById,
             Map<LocalDate, Set<String>> addedServiceIdsByDate,
             Map<LocalDate, Set<String>> removedServiceIdsByDate
     ) {
-        static final Indexes EMPTY = new Indexes(Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of());
+        static final Indexes EMPTY = new Indexes(Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of());
     }
 
     public record Stop(
@@ -1565,6 +1746,16 @@ public class GtfsIndexService {
             return startEpochSeconds <= nowEpochSeconds && nowEpochSeconds <= endEpochSeconds;
         }
     }
+
+    /** Un percorso di linea: una direzione, con le sue fermate in ordine. */
+    public record LinePattern(
+            String line,
+            String routeId,
+            Integer directionId,
+            String headsign,
+            String sampleTripId,
+            List<ScheduledTripStop> stops
+    ) {}
 
     public record ScheduledTripStop(
             String stopId,
