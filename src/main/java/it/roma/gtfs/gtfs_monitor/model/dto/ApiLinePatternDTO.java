@@ -24,8 +24,25 @@ public record ApiLinePatternDTO(
             /** Capolinea della direzione, come compare sui mezzi. */
             String headsign,
             int stopCount,
-            List<ApiLineStopDTO> stops
+            List<ApiLineStopDTO> stops,
+            /**
+             * Tracciato reale della corsa, per disegnare il percorso sulla mappa.
+             * Segue le strade: unire le fermate con segmenti dritti darebbe un
+             * disegno che taglia per i campi.
+             */
+            List<ApiLatLonDTO> shape
     ) {}
+
+    /**
+     * Coordinata del tracciato, arrotondata a cinque decimali (~1 metro).
+     * Il feed le serializza con quattordici: sono nanometri, e su alcune linee
+     * il tracciato ha oltre mille punti.
+     */
+    public record ApiLatLonDTO(double lat, double lon) {
+        public static ApiLatLonDTO of(double lat, double lon) {
+            return new ApiLatLonDTO(Math.round(lat * 1e5) / 1e5, Math.round(lon * 1e5) / 1e5);
+        }
+    }
 
     public record ApiLineStopDTO(
             String stopId,

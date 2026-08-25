@@ -62,6 +62,11 @@ public class ApiCatalogController {
                         p.stops().stream()
                                 .map(s -> new ApiLinePatternDTO.ApiLineStopDTO(
                                         s.stopId(), s.stopName(), s.lat(), s.lon()))
+                                .toList(),
+                        // La corsa campione porta con se' il proprio tracciato: e'
+                        // quello che permette di disegnare il percorso sulle strade.
+                        gtfsIndexService.shapeByTripId(p.sampleTripId()).stream()
+                                .map(sp -> ApiLinePatternDTO.ApiLatLonDTO.of(sp.lat(), sp.lon()))
                                 .toList()))
                 .toList();
         log.debug("GET /api/v1/catalog/lines/{}/pattern -> {} direzioni", line, direzioni.size());
