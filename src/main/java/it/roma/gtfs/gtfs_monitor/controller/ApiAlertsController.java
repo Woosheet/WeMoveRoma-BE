@@ -3,6 +3,7 @@ package it.roma.gtfs.gtfs_monitor.controller;
 import it.roma.gtfs.gtfs_monitor.model.dto.ApiAlertDTO;
 import it.roma.gtfs.gtfs_monitor.model.dto.ApiListResponseDTO;
 import it.roma.gtfs.gtfs_monitor.model.dto.ServiceAlertDTO;
+import it.roma.gtfs.gtfs_monitor.service.AlertSeverityResolver;
 import it.roma.gtfs.gtfs_monitor.service.ServiceAlertsService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -42,11 +43,25 @@ public class ApiAlertsController {
     }
 
     private static ApiAlertDTO toApiDto(ServiceAlertDTO dto) {
-        String line = (dto.getRouteIds() == null || dto.getRouteIds().isEmpty()) ? null : dto.getRouteIds().getFirst();
+        // Un avviso puo' riguardare piu' linee: esporne una sola (com'era prima)
+        // faceva perdere il 75% delle associazioni linea-avviso, e le fermate o
+        // gli itinerari sulle linee "scartate" non mostravano nulla.
+        List<String> lines = dto.getRouteIds() == null ? List.of() : List.copyOf(dto.getRouteIds());
+        String line = lines.isEmpty() ? null : lines.getFirst();
+        // Il feed di Roma non popola mai severity_level: senza derivarla dall'effetto
+        // ogni avviso resterebbe "info" e un servizio sospeso peserebbe come una nota.
+        String declaredSeverity = dto.getSeverita();
         return new ApiAlertDTO(
                 dto.getId(),
                 line,
-                dto.getSeverita(),
+                lines,
+                AlertSeverityResolver.resolve(declaredSeverity, dto.getEffettoCodice()),
+                AlertSeverityResolver.source(declaredSeverity),
+                declaredSeverity,
+                dto.getCausa(),
+                dto.getEffetto(),
+                dto.getCausaCodice(),
+                dto.getEffettoCodice(),
                 dto.getTitolo(),
                 dto.getDescrizione(),
                 dto.getInizio(),

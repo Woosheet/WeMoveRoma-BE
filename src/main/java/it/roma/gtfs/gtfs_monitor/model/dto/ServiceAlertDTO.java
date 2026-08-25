@@ -15,8 +15,13 @@ public class ServiceAlertDTO {
     Instant inizio;            // active_period.start (UTC)
     Instant fine;              // active_period.end   (UTC) - può essere null
     String severita;           // opzionale (non sempre popolato dai feed)
-    String causa;              // CAUSE enum -> stringa
-    String effetto;            // EFFECT enum -> stringa
+    String causa;              // CAUSE enum -> etichetta italiana
+    String effetto;            // EFFECT enum -> etichetta italiana
+    // Codici GTFS-RT non tradotti. Le etichette italiane servono a chi legge, i codici
+    // a chi ragiona: la severita' si deriva da qui (vedi AlertSeverityResolver), cosi'
+    // ritoccare una traduzione non sposta in silenzio la gravita' di un avviso.
+    String causaCodice;        // CAUSE enum, es. CONSTRUCTION
+    String effettoCodice;      // EFFECT enum, es. DETOUR
     List<String> routeIds;
     List<String> tripIds;
     List<String> stopIds;

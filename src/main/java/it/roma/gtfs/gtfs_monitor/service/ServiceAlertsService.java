@@ -5,6 +5,7 @@ import it.roma.gtfs.gtfs_monitor.config.GtfsProperties;
 import it.roma.gtfs.gtfs_monitor.model.dto.ServiceAlertDTO;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -24,10 +25,20 @@ public class ServiceAlertsService {
     private static final int MAX_LIMIT = 5_000;
     private final GtfsProperties props;
     private final WebClient webClient;
+    private final FcmDispatcherService fcmDispatcher;
+    private final AlertsDispatchTracker dispatchTracker;
     private final AtomicReference<CacheEntry<List<ServiceAlertDTO>>> cacheRef =
             new AtomicReference<>(CacheEntry.empty());
     private final Object refreshLock = new Object();
     private static final ZoneId ROME = ZoneId.of("Europe/Rome");
+
+    /** Severities GTFS-RT che fanno scattare la push. Default = SEVERE + WARNING. */
+    @Value("${notifications.alerts.severities:SEVERE,WARNING}")
+    private String alertSeveritiesCsv;
+
+    /** Numero massimo di push per refresh: backstop anti-flood. */
+    @Value("${notifications.alerts.max-per-refresh:5}")
+    private int maxAlertsPerRefresh;
 
 
     private static final Map<String, String> CAUSE_IT = Map.ofEntries(
@@ -164,11 +175,141 @@ public class ServiceAlertsService {
                 List<ServiceAlertDTO> fresh = fetchRemoteSnapshot();
                 if (!fresh.isEmpty() || current.isEmpty()) {
                     cacheRef.set(new CacheEntry<>(List.copyOf(fresh), System.currentTimeMillis()));
+                    dispatchNewAlertsToFcm(fresh);
                 }
             } catch (Exception e) {
                 log.warn("[ServiceAlerts] refresh cache fallito: {}", e.toString());
             }
         }
+    }
+
+    /**
+     * Per ogni alert nello snapshot fresco: se filtra (severity) e non e' mai
+     * stato visto (AlertsDispatchTracker), invia una push al topic FCM.
+     * Backstop {@code maxAlertsPerRefresh}: se ci sono N alert nuovi in un colpo
+     * (es. primo run dopo deploy) spediamo solo i primi N evitando flood.
+     */
+    private void dispatchNewAlertsToFcm(List<ServiceAlertDTO> fresh) {
+        if (fresh == null || fresh.isEmpty()) return;
+        Set<String> wanted = parseSeverities(alertSeveritiesCsv);
+        int sent = 0;
+        // Dedup per id base nello stesso ciclo: lo stesso alert con piu' active
+        // periods viene espanso in piu' DTO ma vogliamo una sola push.
+        Set<String> sentThisCycle = new HashSet<>();
+        for (ServiceAlertDTO dto : fresh) {
+            if (sent >= maxAlertsPerRefresh) break;
+            String id = dto.getId();
+            if (id == null || id.isBlank()) continue;
+            if (!sentThisCycle.add(id)) continue;
+
+            // NB: qui si guarda la severita' DICHIARATA dal feed, non quella derivata
+            // dall'effetto che l'API di lettura espone (AlertSeverityResolver).
+            // Il feed di Roma non dichiara mai la severita', quindi oggi questo filtro
+            // blocca tutto: e' voluto. Usare la severita' derivata renderebbe
+            // notificabili 112 avvisi su 115 — quasi tutti deviazioni per lavori —
+            // cioe' spam. Allargare le push e' una decisione a se', con criteri suoi.
+            if (!wanted.isEmpty() && (dto.getSeverita() == null || !wanted.contains(dto.getSeverita().toUpperCase(Locale.ROOT)))) {
+                continue;
+            }
+            // Key dispatch: id+inizio_epoch — un alert con stesso id ma diverso
+            // active period e' un evento ri-comunicabile.
+            String dispatchKey = id + "@" + (dto.getInizio() == null ? "" : dto.getInizio().getEpochSecond());
+            if (!dispatchTracker.markIfNew(dispatchKey)) {
+                continue;
+            }
+
+            String title = buildPushTitle(dto);
+            String body  = buildPushBody(dto);
+            Map<String, String> data = buildPushData(dto);
+            if (fcmDispatcher.sendToTopic(fcmDispatcher.topicAlerts(), title, body, data)) {
+                sent++;
+            }
+        }
+        if (sent > 0) {
+            log.info("[ServiceAlerts] dispatched {} push notifications (cycle).", sent);
+        }
+    }
+
+    private static Set<String> parseSeverities(String csv) {
+        if (csv == null || csv.isBlank()) return Set.of();
+        Set<String> out = new HashSet<>();
+        for (String s : csv.split(",")) {
+            String n = s.trim().toUpperCase(Locale.ROOT);
+            if (!n.isEmpty()) out.add(n);
+        }
+        return out;
+    }
+
+    /**
+     * Titolo push: prefisso emoji per severity + lista linee (se brevi) + effetto.
+     * Esempi reali:
+     *   🚨 Linee 31, 32 — Servizio sospeso
+     *   ⚠️ Linea 49 — Deviazione
+     *   🚨 Servizio sospeso (se non ci sono routes)
+     */
+    private static String buildPushTitle(ServiceAlertDTO dto) {
+        String prefix = "SEVERE".equalsIgnoreCase(dto.getSeverita()) ? "🚨 " : "⚠️ ";
+        String routesPart = routesShort(dto.getRouteIds());
+        String effetto = dto.getEffetto();
+        if (effetto == null || effetto.isBlank()) {
+            // Fallback al titolo upstream se l'effetto manca
+            String header = dto.getTitolo();
+            if (header == null || header.isBlank()) header = "Avviso WeMoveRoma";
+            return prefix + truncate(routesPart == null ? header : routesPart + " — " + header, 70);
+        }
+        if (routesPart != null) {
+            return prefix + truncate(routesPart + " — " + effetto, 70);
+        }
+        return prefix + truncate(effetto, 70);
+    }
+
+    /**
+     * Body push: descrizione GTFS pulita, senza ripetere le linee gia' nel titolo.
+     * Tronca a 180 char (oltre, iOS taglia col "..." automatico).
+     */
+    private static String buildPushBody(ServiceAlertDTO dto) {
+        String desc = dto.getDescrizione();
+        if (desc != null && !desc.isBlank()) {
+            return truncate(desc.trim(), 180);
+        }
+        // Niente descrizione: usa il titolo upstream o ricostruisci dall'effetto+causa
+        if (dto.getTitolo() != null && !dto.getTitolo().isBlank()) {
+            return truncate(dto.getTitolo(), 180);
+        }
+        StringBuilder sb = new StringBuilder();
+        if (dto.getCausa() != null) sb.append(dto.getCausa()).append(". ");
+        if (dto.getEffetto() != null) sb.append(dto.getEffetto()).append('.');
+        return truncate(sb.toString().trim(), 180);
+    }
+
+    /**
+     * Formatta routes per il titolo. Per 1-3 linee → "Linea X" o "Linee X, Y, Z".
+     * Per piu' linee → "5 linee" (titoli troppo lunghi sono brutti nella drawer).
+     */
+    private static String routesShort(List<String> routes) {
+        if (routes == null || routes.isEmpty()) return null;
+        if (routes.size() == 1) return "Linea " + routes.get(0);
+        if (routes.size() <= 3) return "Linee " + String.join(", ", routes);
+        return routes.size() + " linee";
+    }
+
+    private static Map<String, String> buildPushData(ServiceAlertDTO dto) {
+        Map<String, String> out = new java.util.HashMap<>();
+        out.put("kind", "alert");
+        if (dto.getId() != null) out.put("alertId", dto.getId());
+        if (dto.getRouteIds() != null && !dto.getRouteIds().isEmpty()) {
+            out.put("routes", String.join(",", dto.getRouteIds()));
+        }
+        if (dto.getSeverita() != null) out.put("severity", dto.getSeverita());
+        // Deep link interno: la app potra' aprirlo direttamente sulla schermata Avvisi.
+        out.put("deeplink", "wemoveroma://alerts");
+        return out;
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return "";
+        if (s.length() <= max) return s;
+        return s.substring(0, Math.max(0, max - 1)).trim() + "…";
     }
 
     private List<ServiceAlertDTO> fetchRemoteSnapshot() {
@@ -212,8 +353,10 @@ public class ServiceAlertsService {
                 List<String> tripIds = trips.isEmpty() ? null : List.copyOf(trips);
                 List<String> stopIds = stops.isEmpty() ? null : List.copyOf(stops);
 
-                String effect = a.hasEffect() ? translateEffect(a.getEffect().name()) : null;
-                String cause  = a.hasCause()  ? translateCause(a.getCause().name())  : null;
+                String effectCode = a.hasEffect() ? a.getEffect().name() : null;
+                String causeCode  = a.hasCause()  ? a.getCause().name()  : null;
+                String effect = translateEffect(effectCode);
+                String cause  = translateCause(causeCode);
                 String sev    = a.hasSeverityLevel() ? a.getSeverityLevel().name() : null;
 
                 for (var pr : periods) {
@@ -230,6 +373,8 @@ public class ServiceAlertsService {
                             .severita(sev)
                             .causa(cause)
                             .effetto(effect)
+                            .causaCodice(causeCode)
+                            .effettoCodice(effectCode)
                             .routeIds(routeIds)
                             .tripIds(tripIds)
                             .stopIds(stopIds)

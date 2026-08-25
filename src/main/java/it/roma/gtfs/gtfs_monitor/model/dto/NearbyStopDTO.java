@@ -9,6 +9,12 @@ public record NearbyStopDTO(
         Double lon,
         Integer distanceMeters,
         Integer walkMinutes,
+        /**
+         * Linee servite dalla fermata nella giornata di servizio, a prescindere
+         * dagli arrivi presenti in questo momento: di notte `arrivals` puo'
+         * essere vuoto mentre la fermata resta servita da quelle linee.
+         */
+        List<String> servedLines,
         List<NearbyArrivalDTO> arrivals
 ) {
 }
