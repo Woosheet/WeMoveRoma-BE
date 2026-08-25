@@ -6,6 +6,7 @@ import it.roma.gtfs.gtfs_monitor.service.GtfsIndexService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -15,6 +16,7 @@ import org.springframework.web.server.ResponseStatusException;
 
 import java.time.Instant;
 import java.util.Comparator;
+import java.time.LocalDate;
 import java.util.List;
 
 @Slf4j
@@ -43,7 +45,13 @@ public class ApiCatalogController {
      * reale senza corse attive.
      */
     @GetMapping("/lines/{line}/pattern")
-    public ApiLinePatternDTO linePattern(@PathVariable String line) {
+    public ApiLinePatternDTO linePattern(
+            @PathVariable String line,
+            /**
+             * Giornata di servizio per gli orari. Assente: nessun orario, solo il
+             * percorso — che e' l'unica parte davvero indipendente dalla data.
+             */
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date) {
         // Con gli indici ancora vuoti nessuna linea esiste: 503, non 404 (stessa
         // convenzione di ApiStopsController e ApiTripsController).
         if (!gtfsIndexService.isStaticDataLoaded()) {
@@ -54,7 +62,7 @@ public class ApiCatalogController {
             throw new ResourceNotFoundException("Linea", line);
         }
 
-        List<ApiLinePatternDTO.ApiLineDirectionDTO> direzioni = gtfsIndexService.linePatterns(line).stream()
+        List<ApiLinePatternDTO.ApiLineDirectionDTO> direzioni = gtfsIndexService.linePatterns(line, date).stream()
                 .map(p -> new ApiLinePatternDTO.ApiLineDirectionDTO(
                         p.directionId(),
                         p.headsign(),
@@ -63,6 +71,12 @@ public class ApiCatalogController {
                                 .map(s -> new ApiLinePatternDTO.ApiLineStopDTO(
                                         s.stopId(), s.stopName(), s.lat(), s.lon()))
                                 .toList(),
+                        p.schedule() == null ? null : new ApiLinePatternDTO.ApiLineScheduleDTO(
+                                p.schedule().serviceDate().toString(),
+                                ApiLinePatternDTO.ApiLineScheduleDTO.orario(p.schedule().firstDepartureSeconds()),
+                                ApiLinePatternDTO.ApiLineScheduleDTO.orario(p.schedule().lastDepartureSeconds()),
+                                p.schedule().tripCount(),
+                                p.schedule().typicalHeadwayMinutes()),
                         // La corsa campione porta con se' il proprio tracciato: e'
                         // quello che permette di disegnare il percorso sulle strade.
                         gtfsIndexService.shapeByTripId(p.sampleTripId()).stream()

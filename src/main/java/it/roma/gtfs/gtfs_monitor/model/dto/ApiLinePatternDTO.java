@@ -25,6 +25,8 @@ public record ApiLinePatternDTO(
             String headsign,
             int stopCount,
             List<ApiLineStopDTO> stops,
+            /** Orari della giornata richiesta; null se la linea non circola quel giorno. */
+            ApiLineScheduleDTO schedule,
             /**
              * Tracciato reale della corsa, per disegnare il percorso sulla mappa.
              * Segue le strade: unire le fermate con segmenti dritti darebbe un
@@ -32,6 +34,27 @@ public record ApiLinePatternDTO(
              */
             List<ApiLatLonDTO> shape
     ) {}
+
+    /**
+     * Orario di servizio di una direzione in una giornata.
+     *
+     * Gli orari sono stringhe "HH:mm" gia' riportate nell'arco delle 24 ore: nel
+     * GTFS una corsa dell'una di notte appartiene al giorno precedente ed e'
+     * scritta 25:00, che sul sito non vorrebbe dire niente.
+     */
+    public record ApiLineScheduleDTO(
+            String serviceDate,
+            String firstDeparture,
+            String lastDeparture,
+            int tripCount,
+            /** Intervallo tipico fra due partenze, in minuti. Null con meno di tre corse. */
+            Integer typicalHeadwayMinutes
+    ) {
+        public static String orario(int secondi) {
+            int m = Math.floorMod(secondi / 60, 24 * 60);
+            return String.format("%02d:%02d", m / 60, m % 60);
+        }
+    }
 
     /**
      * Coordinata del tracciato, arrotondata a cinque decimali (~1 metro).

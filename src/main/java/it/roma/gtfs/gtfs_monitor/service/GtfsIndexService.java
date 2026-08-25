@@ -454,6 +454,19 @@ public class GtfsIndexService {
      * le linee le cui corse campionate non girano oggi (verificato sulla 160).
      */
     public List<LinePattern> linePatterns(String line) {
+        return linePatterns(line, null);
+    }
+
+    /**
+     * Come sopra, ma con gli orari della giornata indicata: prima corsa, ultima
+     * corsa, numero di corse e intervallo tipico fra una e l'altra.
+     *
+     * Una data sola e non i tre giorni-tipo (feriale, sabato, domenica): la cache
+     * degli indici per-data tiene solo il giorno richiesto e i due adiacenti, e
+     * chiederne tre lontani fra loro la farebbe ricostruire a ogni richiesta,
+     * un secondo e mezzo e decine di MB per volta.
+     */
+    public List<LinePattern> linePatterns(String line, LocalDate serviceDate) {
         if (line == null || line.isBlank()) {
             return List.of();
         }
@@ -495,13 +508,15 @@ public class GtfsIndexService {
 
                 Trip trip = indexes.trips().get(tripMigliore);
                 String capolinea = trip == null ? null : trip.headsign();
+                LineSchedule orari = serviceDate == null ? null : orariDelGruppo(candidati, serviceDate);
                 perDirezione.putIfAbsent(entry.getKey(), new LinePattern(
                         line,
                         routeId,
                         trip == null ? null : trip.directionId(),
                         capolinea,
                         tripMigliore,
-                        migliore
+                        migliore,
+                        orari
                 ));
             }
         }
@@ -1156,6 +1171,54 @@ public class GtfsIndexService {
     }
 
     /**
+     * Prima corsa, ultima corsa, numero di corse e intervallo tipico di un gruppo
+     * di viaggi in una giornata.
+     *
+     * L'intervallo e' la <b>mediana</b> degli scarti fra partenze consecutive, non
+     * la media: su una linea che di notte si dirada, un solo buco di tre ore
+     * sposterebbe la media a valori che non descrivono nessun momento della
+     * giornata. La mediana risponde alla domanda vera, "quanto aspetto di solito".
+     */
+    private LineSchedule orariDelGruppo(List<String> tripIds, LocalDate serviceDate) {
+        Map<String, ActiveTripSchedule> attive = activeTripIndexForDate(serviceDate).byTripId();
+        List<Integer> partenze = new ArrayList<>();
+        for (String tripId : tripIds) {
+            ActiveTripSchedule s = attive.get(tripId);
+            if (s != null) {
+                partenze.add(s.startTimeSeconds());
+            }
+        }
+        if (partenze.isEmpty()) {
+            return null;
+        }
+        Collections.sort(partenze);
+
+        Integer intervallo = null;
+        if (partenze.size() >= 3) {
+            List<Integer> scarti = new ArrayList<>(partenze.size() - 1);
+            for (int i = 1; i < partenze.size(); i++) {
+                int scarto = partenze.get(i) - partenze.get(i - 1);
+                // Due corse alla stessa ora sono due mezzi in partenza insieme, non
+                // una frequenza di zero minuti.
+                if (scarto > 0) scarti.add(scarto);
+            }
+            if (!scarti.isEmpty()) {
+                Collections.sort(scarti);
+                int mediana = scarti.get(scarti.size() / 2);
+                intervallo = Math.max(1, Math.round(mediana / 60f));
+            }
+        }
+
+        return new LineSchedule(
+                serviceDate,
+                partenze.get(0),
+                partenze.get(partenze.size() - 1),
+                partenze.size(),
+                intervallo
+        );
+    }
+
+    /**
      * Sequenza di fermate di una corsa <b>senza</b> il filtro di validita' del servizio,
      * per descrivere il tracciato di una linea. Gli orari restano {@code null}: sono relativi
      * a una data di servizio, che qui non esiste.
@@ -1754,7 +1817,25 @@ public class GtfsIndexService {
             Integer directionId,
             String headsign,
             String sampleTripId,
-            List<ScheduledTripStop> stops
+            List<ScheduledTripStop> stops,
+            /** Orari della giornata richiesta; null se non e' stata chiesta una data. */
+            LineSchedule schedule
+    ) {}
+
+    /**
+     * Orario di servizio di una direzione in una giornata.
+     *
+     * I secondi possono superare le 24 ore: nel GTFS una corsa che parte all'una
+     * di notte appartiene al giorno di servizio precedente ed e' scritta 25:00.
+     * La conversione in orario leggibile spetta a chi presenta il dato.
+     */
+    public record LineSchedule(
+            LocalDate serviceDate,
+            int firstDepartureSeconds,
+            int lastDepartureSeconds,
+            int tripCount,
+            /** Intervallo tipico fra due partenze, in minuti. Null con meno di tre corse. */
+            Integer typicalHeadwayMinutes
     ) {}
 
     public record ScheduledTripStop(
