@@ -9,6 +9,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientRequestException;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 
 import java.time.Instant;
 import java.time.ZoneId;
@@ -22,6 +24,9 @@ import java.util.concurrent.atomic.AtomicReference;
 @RequiredArgsConstructor
 public class VehiclePositionsService {
     private static final long DEFAULT_REFRESH_MILLIS = 5_000L;
+
+    /** Pausa fra un tentativo e l'altro, come in TripUpdatesService. */
+    private static final long RETRY_BACKOFF_MILLIS = 400L;
     private static final int MAX_LIMIT = 5_000;
 
     private static final ZoneId ROME = ZoneId.of("Europe/Rome");
@@ -116,23 +121,48 @@ public class VehiclePositionsService {
         }
     }
 
+    /**
+     * Stessa gestione dei tentativi di {@code TripUpdatesService}.
+     *
+     * Prima il ritentativo valeva solo per il protobuf corrotto: un 502 di
+     * Roma Mobilita' finiva nel catch generico, si arrendeva subito e loggava
+     * ERROR. Gli aggiornamenti delle corse invece ritentavano e passavano.
+     * Stesso feed, stesso singhiozzo, due comportamenti: le posizioni dei mezzi
+     * saltavano un ciclo e il log si riempiva di ERROR per un guasto passeggero
+     * di cui il codice sa gia' riprendersi.
+     */
     private List<VehiclePositionDTO> fetchRemoteSnapshot() {
-        try {
-            return fetchRemoteSnapshotOnce();
-        } catch (InvalidProtocolBufferException pe) {
-            log.warn("[VehiclePositions] protobuf corrotto (tentativo 1), retry immediato: {}", pe.toString());
+        int attempt = 1;
+        while (true) {
             try {
                 return fetchRemoteSnapshotOnce();
-            } catch (InvalidProtocolBufferException retryPe) {
-                log.error("[VehiclePositions] feed protobuf corrotto anche al retry: {}", retryPe.toString());
-                return List.of();
-            } catch (Exception retryEx) {
-                log.error("[VehiclePositions] retry fallito: {}", retryEx.toString());
+            } catch (InvalidProtocolBufferException e) {
+                if (attempt >= 2) {
+                    log.error("[VehiclePositions] feed protobuf corrotto anche al retry: {}", e.toString());
+                    return List.of();
+                }
+                log.warn("[VehiclePositions] protobuf corrotto (tentativo {}), retry immediato: {}", attempt, e.toString());
+            } catch (WebClientResponseException.BadGateway | WebClientRequestException e) {
+                if (attempt >= 2) {
+                    log.warn("[VehiclePositions] refresh cache fallito anche al retry: {}", e.toString());
+                    return List.of();
+                }
+                log.warn("[VehiclePositions] upstream temporaneamente non disponibile (tentativo {}), retry immediato: {}", attempt, e.toString());
+            } catch (Exception e) {
+                log.error("[VehiclePositions] fetch/parsing error: {}", e.toString());
                 return List.of();
             }
-        } catch (Exception e) {
-            log.error("[VehiclePositions] fetch/parsing error: {}", e.toString());
-            return List.of();
+
+            attempt++;
+            sleepBeforeRetry();
+        }
+    }
+
+    private static void sleepBeforeRetry() {
+        try {
+            Thread.sleep(RETRY_BACKOFF_MILLIS);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
         }
     }
 
