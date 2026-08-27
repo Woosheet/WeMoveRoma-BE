@@ -16,6 +16,7 @@ public class DashboardService {
     private final VehiclePositionsService vehiclePositionsService;
     private final TripUpdatesService tripUpdatesService;
     private final ServiceAlertsService serviceAlertsService;
+    private final StaticGtfsUpdater staticGtfsUpdater;
 
     public DashboardSummaryDTO summary(String linea, String destination) {
         List<VehiclePositionDTO> vehicles = vehiclePositionsService.fetch(linea, destination, null);
@@ -37,7 +38,8 @@ public class DashboardService {
                 activeLines,
                 delayedVehicles,
                 alertsActive,
-                generatedAt
+                generatedAt,
+                staticGtfsUpdater.feedLastModified()
         );
     }
 }

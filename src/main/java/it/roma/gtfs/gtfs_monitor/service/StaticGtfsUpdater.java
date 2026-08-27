@@ -1,6 +1,7 @@
 package it.roma.gtfs.gtfs_monitor.service;
 
 import it.roma.gtfs.gtfs_monitor.config.GtfsProperties;
+import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
@@ -25,6 +26,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.ZipEntry;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.zip.ZipFile;
 
 @Slf4j
@@ -68,11 +71,84 @@ public class StaticGtfsUpdater {
         Files.createDirectories(Path.of(props.staticProps().dataDir()));
     }
 
+    /**
+     * Ultimo Last-Modified dichiarato dal feed statico, in formato RFC 1123.
+     * Null finche' non se ne conosce uno. Lo consuma il summary della dashboard:
+     * serve a chi rigenera gli snapshot per sapere se vale la pena rifare il
+     * lavoro, invece di riscaricare tutto ogni notte.
+     */
+    public String feedLastModified() {
+        return lastModified;
+    }
+
+    /**
+     * Riprende etag e last-modified dal disco.
+     *
+     * Senza questo, dopo ogni riavvio i due campi ripartivano da null: la
+     * richiesta condizionale non poteva essere inviata e il feed veniva
+     * riscaricato per intero — una sessantina di MB — anche quando non era
+     * cambiato di una riga. Lo stato lo scrivevamo gia' a ogni refresh, solo
+     * non lo rileggevamo mai.
+     */
+    @PostConstruct
+    void riprendiStato() {
+        try {
+            Path stateFile = Path.of(props.staticProps().dataDir()).resolve(".gtfs_static_state.json");
+            if (!Files.isRegularFile(stateFile)) return;
+            String json = Files.readString(stateFile);
+            this.etag = estraiCampo(json, "etag");
+            this.lastModified = estraiCampo(json, "last_modified");
+            log.info("[StaticGTFS] Stato ripreso dal disco: ETag={} Last-Modified={}", etag, lastModified);
+        } catch (Exception e) {
+            log.warn("[StaticGTFS] Stato non ripreso ({}): riparto senza richiesta condizionale.", e.toString());
+        }
+    }
+
+    /* Il file lo scriviamo noi con un template a tre campi: un'espressione
+       regolare basta e non aggiunge un parser JSON solo per questo. */
+    private static String estraiCampo(String json, String nome) {
+        Matcher m = Pattern.compile("\"" + nome + "\"\\s*:\\s*\"([^\"]*)\"").matcher(json);
+        if (!m.find()) return null;
+        String valore = m.group(1).trim();
+        return valore.isEmpty() ? null : valore;
+    }
+
     @EventListener(ApplicationReadyEvent.class)
     public void onApplicationReady() {
-        Thread t = new Thread(() -> runRefresh("startup"), "static-gtfs-startup-refresh");
+        Thread t = new Thread(() -> {
+            costruisciIndiciDaDisco();
+            runRefresh("startup");
+        }, "static-gtfs-startup-refresh");
         t.setDaemon(true);
         t.start();
+    }
+
+    /**
+     * Indici dal feed gia' presente sul disco, prima ancora di sentire la rete.
+     *
+     * Serve perche' il refresh d'avvio puo' finire con un 304: in quel caso non
+     * c'e' nessuno zip da estrarre e il percorso che ricostruisce gli indici non
+     * viene mai attraversato. Finche' lo stato non veniva ripreso dal disco la
+     * cosa restava nascosta — la richiesta condizionale non partiva, la risposta
+     * era sempre 200 e gli indici si ricostruivano come effetto collaterale del
+     * download. Ora che il 304 funziona, l'applicazione partirebbe con il
+     * catalogo vuoto.
+     *
+     * Gli indici vanno costruiti da cio' che c'e' sul disco; scaricare serve ad
+     * aggiornare quel disco, non a popolare la memoria.
+     */
+    private void costruisciIndiciDaDisco() {
+        Path stopTimes = Path.of(props.staticProps().dataDir()).resolve("stop_times.txt");
+        if (!Files.isRegularFile(stopTimes)) {
+            log.info("[StaticGTFS] Nessun feed sul disco: gli indici arriveranno col primo download.");
+            return;
+        }
+        try {
+            indexService.rebuildIndexes();
+            log.info("[StaticGTFS] Indici costruiti dal feed gia' presente sul disco");
+        } catch (Exception e) {
+            log.error("[StaticGTFS] Costruzione indici dal disco fallita: {}", e.toString());
+        }
     }
 
     /**
