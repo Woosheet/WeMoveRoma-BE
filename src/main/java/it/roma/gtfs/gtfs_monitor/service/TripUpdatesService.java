@@ -159,6 +159,15 @@ public class TripUpdatesService {
                     return List.of();
                 }
                 log.warn("[TripUpdates] upstream temporaneamente non disponibile (tentativo {}), retry immediato: {}", attempt, e.toString());
+            } catch (WebClientResponseException.Forbidden | WebClientResponseException.TooManyRequests e) {
+                /*
+                 * Il filtro anti-bot davanti al feed ogni tanto respinge il poll.
+                 * Non si ritenta: insistere su un rate limit lo peggiora, e il
+                 * giro successivo fra 5 secondi e' gia' il tentativo dopo. La
+                 * cache precedente resta servita, quindi nessuno se ne accorge.
+                 */
+                log.warn("[TripUpdates] poll respinto dall'upstream, servo la cache precedente: {}", e.toString());
+                return List.of();
             } catch (Exception e) {
                 log.error("[TripUpdates] fetch/parsing error: {}", e.toString());
                 return List.of();

@@ -6,6 +6,7 @@ import io.netty.handler.timeout.WriteTimeoutHandler;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.client.reactive.ReactorClientHttpConnector;
 import org.springframework.web.reactive.function.client.ExchangeFilterFunction;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -21,11 +22,20 @@ import java.time.Duration;
 @Configuration
 public class WebClientConfig {
 
+    /*
+     * Reactor Netty non manda alcun User-Agent, e per un filtro anti-bot una
+     * richiesta senza User-Agent e' il primo indizio di traffico automatico:
+     * i 403 sporadici su romamobilita.it partono da li'. Dichiarare chi siamo
+     * e' anche la cortesia dovuta a chi pubblica il feed.
+     */
+    private static final String USER_AGENT = "WeMoveRoma/1.0 (+https://www.wemoveroma.com)";
+
     @Bean
     @Primary
     public WebClient webClient(WebClient.Builder builder) {
         return builder
                 .clientConnector(new ReactorClientHttpConnector(newHttpClient(Duration.ofSeconds(30), 30)))
+                .defaultHeader(HttpHeaders.USER_AGENT, USER_AGENT)
                 .codecs(c -> c.defaultCodecs().maxInMemorySize(20 * 1024 * 1024)) // 20MB
                 .filter(retryOn5xxFilter())
                 .filter(retryFilter())
@@ -36,6 +46,7 @@ public class WebClientConfig {
     public WebClient staticGtfsWebClient(WebClient.Builder builder) {
         return builder
                 .clientConnector(new ReactorClientHttpConnector(newHttpClient(Duration.ofSeconds(120), 120)))
+                .defaultHeader(HttpHeaders.USER_AGENT, USER_AGENT)
                 .codecs(c -> c.defaultCodecs().maxInMemorySize(150 * 1024 * 1024)) // 150MB
                 .filter(retryOn5xxFilter())
                 .filter(retryFilter())
