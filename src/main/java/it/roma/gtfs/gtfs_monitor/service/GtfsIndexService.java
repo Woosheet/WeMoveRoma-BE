@@ -24,6 +24,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
@@ -426,12 +427,18 @@ public class GtfsIndexService {
             return List.of();
         }
 
-        ZonedDateTime nowRome = ZonedDateTime.ofInstant(now, ROME_ZONE);
-        List<ScheduledTripStop> today = scheduledNextStopsForTripOnDate(trip, nowRome.toLocalDate(), now.getEpochSecond(), limit);
-        if (!today.isEmpty()) {
-          return today;
+        // Si parte da ieri: dopo mezzanotte le corse notturne appartengono ancora
+        // al giorno di servizio precedente (orari 24:xx, 25:xx). Quella di ieri
+        // restituisce qualcosa solo se e' ancora in viaggio, quindi non ruba il
+        // posto alla corsa di oggi.
+        LocalDate oggi = ZonedDateTime.ofInstant(now, ROME_ZONE).toLocalDate();
+        for (LocalDate data : List.of(oggi.minusDays(1), oggi, oggi.plusDays(1))) {
+            List<ScheduledTripStop> prossime = scheduledNextStopsForTripOnDate(trip, data, now.getEpochSecond(), limit);
+            if (!prossime.isEmpty()) {
+                return prossime;
+            }
         }
-        return scheduledNextStopsForTripOnDate(trip, nowRome.toLocalDate().plusDays(1), now.getEpochSecond(), limit);
+        return List.of();
     }
 
     /**
@@ -543,12 +550,47 @@ public class GtfsIndexService {
         }
 
         Instant reference = when != null ? when : Instant.now();
-        ZonedDateTime whenRome = ZonedDateTime.ofInstant(reference, ROME_ZONE);
-        List<ScheduledTripStop> currentDate = scheduledStopsForTripOnDate(trip, whenRome.toLocalDate());
-        if (!currentDate.isEmpty()) {
-            return currentDate;
+        LocalDate oggi = ZonedDateTime.ofInstant(reference, ROME_ZONE).toLocalDate();
+
+        // Ieri, oggi e domani, e vince la corsa piu' vicina all'istante richiesto.
+        // Prima si guardavano solo oggi e domani: dopo mezzanotte una corsa
+        // notturna ancora in viaggio (orari 24:xx del giorno di servizio di ieri)
+        // risultava "non programmata", e la mappa del bus seguito mostrava il
+        // percorso senza fermate. A parita' di distanza vince la corsa successiva.
+        List<ScheduledTripStop> migliore = List.of();
+        long distanzaMigliore = Long.MAX_VALUE;
+        for (LocalDate data : List.of(oggi.minusDays(1), oggi, oggi.plusDays(1))) {
+            List<ScheduledTripStop> stops = scheduledStopsForTripOnDate(trip, data);
+            if (stops.isEmpty()) {
+                continue;
+            }
+            long distanza = distanzaDallaCorsa(reference, stops);
+            if (distanza <= distanzaMigliore) {
+                migliore = stops;
+                distanzaMigliore = distanza;
+            }
         }
-        return scheduledStopsForTripOnDate(trip, whenRome.toLocalDate().plusDays(1));
+        return migliore;
+    }
+
+    /** Secondi fra l'istante e la corsa: zero se la corsa e' in viaggio in quel momento. */
+    private static long distanzaDallaCorsa(Instant reference, List<ScheduledTripStop> stops) {
+        Instant inizio = primoOrario(stops.getFirst());
+        Instant fine = primoOrario(stops.getLast());
+        if (inizio == null || fine == null) {
+            return Long.MAX_VALUE - 1;
+        }
+        if (reference.isBefore(inizio)) {
+            return Duration.between(reference, inizio).getSeconds();
+        }
+        if (reference.isAfter(fine)) {
+            return Duration.between(fine, reference).getSeconds();
+        }
+        return 0;
+    }
+
+    private static Instant primoOrario(ScheduledTripStop stop) {
+        return stop.departureTime() != null ? stop.departureTime() : stop.arrivalTime();
     }
 
     private String resolveKnownTripId(String tripId) {

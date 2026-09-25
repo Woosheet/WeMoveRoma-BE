@@ -48,6 +48,7 @@ class GtfsIndexServiceScheduledStopsTest {
                 route_id,service_id,trip_id,trip_headsign,trip_short_name,direction_id,block_id,shape_id,wheelchair_accessible,exceptional
                 R1,SVC1,T1,Termini,,0,,,1,0
                 R1,SVC1,T2,San Pietro,,1,,,1,0
+                R1,SVC1,T3,Notturna,,0,,,1,0
                 """);
         write("calendar_dates.txt", """
                 service_id,date,exception_type
@@ -60,6 +61,8 @@ class GtfsIndexServiceScheduledStopsTest {
                 T1,08:10:00,08:10:30,S3,3
                 T2,09:00:00,09:00:00,S4,1
                 T2,09:04:00,09:04:00,S1,2
+                T3,24:05:00,24:05:00,S1,1
+                T3,24:20:00,24:20:00,S2,2
                 """);
 
         GtfsProperties props = new GtfsProperties(
@@ -133,6 +136,29 @@ class GtfsIndexServiceScheduledStopsTest {
 
         assertEquals(before, service.scheduledStopsForTrip("T1", when));
         assertEquals(List.of("S4", "S1", "S2"), stopIds(service.scheduledStopsForTrip("T2", when)));
+    }
+
+    @Test
+    void nightTripStillRunningAfterMidnightUsesPreviousServiceDate() {
+        // 00:10 del 22/07: la T3 (24:05-24:20) e' la corsa del giorno di servizio
+        // 21/07 ancora in viaggio. Prima si cercava solo il 22 e il 23 -> vuoto.
+        Instant now = SERVICE_DATE.plusDays(1).atTime(0, 10).atZone(ROME_ZONE).toInstant();
+
+        List<GtfsIndexService.ScheduledTripStop> stops = service.scheduledStopsForTrip("T3", now);
+
+        assertEquals(List.of("S1", "S2"), stopIds(stops));
+        long serviceStart = SERVICE_DATE.atStartOfDay(ROME_ZONE).toEpochSecond();
+        assertEquals(Instant.ofEpochSecond(serviceStart + 24 * 3600 + 5 * 60), stops.getFirst().arrivalTime());
+        assertEquals(List.of("S1", "S2"), stopIds(service.scheduledNextStopsForTrip("T3", now, 10)));
+    }
+
+    @Test
+    void finishedTripOfYesterdayDoesNotHideTodaysNextStops() {
+        // Stessa corsa, a corsa finita: le prossime fermate di ieri non esistono
+        // piu' e il 22 SVC1 non e' attivo, quindi niente da mostrare.
+        Instant later = SERVICE_DATE.plusDays(1).atTime(1, 0).atZone(ROME_ZONE).toInstant();
+
+        assertEquals(List.of(), service.scheduledNextStopsForTrip("T3", later, 10));
     }
 
     @Test
