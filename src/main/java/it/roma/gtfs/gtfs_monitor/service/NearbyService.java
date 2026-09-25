@@ -54,6 +54,17 @@ public class NearbyService {
                 .toList();
     }
 
+    /**
+     * Elenca le fermate, con diradamento spaziale quando sono piu' di {@code limit}.
+     *
+     * <p>Prima si ordinava per nome e si troncava: chiedere meno fermate dava una
+     * fetta <em>alfabetica</em>, cioe' tutte ammassate dove capitava, non un
+     * campione della zona. Con la mappa cittadina (7.215 fermate su Roma, 860 KB)
+     * il client non ha modo di chiederne "un po' ovunque".
+     *
+     * <p>Ora, se il risultato eccede il tetto richiesto, si tiene una fermata per
+     * cella di una griglia: il campione resta distribuito su tutto il riquadro.
+     */
     public List<ApiStopSearchItemDTO> listStops(
             Double minLat,
             Double maxLat,
@@ -63,14 +74,21 @@ public class NearbyService {
     ) {
         int max = limit == null || limit <= 0 ? 10000 : Math.min(limit, 10000);
         boolean bounded = minLat != null && maxLat != null && minLon != null && maxLon != null;
-        return gtfsIndexService.allStops().stream()
+
+        List<GtfsIndexService.Stop> candidate = gtfsIndexService.allStops().stream()
                 .filter(stop -> stop.lat() != null && stop.lon() != null)
                 .filter(stop -> !bounded || (
                         stop.lat() >= minLat && stop.lat() <= maxLat &&
                         stop.lon() >= minLon && stop.lon() <= maxLon
                 ))
                 .sorted(Comparator.comparing(GtfsIndexService.Stop::name, String.CASE_INSENSITIVE_ORDER))
-                .limit(max)
+                .toList();
+
+        List<GtfsIndexService.Stop> scelte = candidate.size() <= max
+                ? candidate
+                : diradaSuGriglia(candidate, max);
+
+        return scelte.stream()
                 .map(stop -> new ApiStopSearchItemDTO(
                         stop.id(),
                         stop.code(),
@@ -79,6 +97,88 @@ public class NearbyService {
                         stop.lon() != null ? stop.lon().doubleValue() : null
                 ))
                 .toList();
+    }
+
+    /**
+     * Tiene una fermata per cella di griglia, per ottenere {@code max} punti
+     * distribuiti invece di una fetta ordinata per nome.
+     *
+     * <p>Il lato della cella e' <strong>quantizzato su potenze di due</strong> e la
+     * griglia e' ancorata all'origine delle coordinate, non al riquadro chiesto.
+     * Serve a rendere il campione stabile: senza, ogni piccolo spostamento della
+     * mappa cambierebbe leggermente il lato della cella, e le fermate mostrate
+     * salterebbero da una all'altra a ogni trascinamento.
+     *
+     * <p>La fermata scelta dentro una cella e' la prima in ordine di nome: e'
+     * arbitraria ma <em>deterministica</em>, quindi la stessa cella restituisce
+     * sempre la stessa fermata.
+     */
+    private List<GtfsIndexService.Stop> diradaSuGriglia(List<GtfsIndexService.Stop> stops, int max) {
+        double minLat = Double.MAX_VALUE, maxLat = -Double.MAX_VALUE;
+        double minLon = Double.MAX_VALUE, maxLon = -Double.MAX_VALUE;
+        for (GtfsIndexService.Stop s : stops) {
+            double la = s.lat().doubleValue(), lo = s.lon().doubleValue();
+            if (la < minLat) minLat = la;
+            if (la > maxLat) maxLat = la;
+            if (lo < minLon) minLon = lo;
+            if (lo > maxLon) maxLon = lo;
+        }
+        double span = Math.max(maxLat - minLat, maxLon - minLon);
+        if (span <= 0) {
+            return stops.subList(0, Math.min(max, stops.size()));
+        }
+
+        /*
+         * Il lato della cella e' quantizzato su una scala discreta e la griglia
+         * e' ancorata all'origine delle coordinate, non al riquadro chiesto.
+         * Serve a rendere il campione stabile: senza, ogni piccolo spostamento
+         * della mappa cambierebbe di poco il lato, e le fermate mostrate
+         * salterebbero da una all'altra a ogni trascinamento.
+         *
+         * La scala ha passo 2^(1/4) e non 2. Con i raddoppi il lato saltava
+         * troppo: dimezzandolo le celle quadruplicano, quindi o si sforava il
+         * tetto o si restava larghissimi — con tetto 400 tornavano 136 fermate,
+         * due terzi del budget sprecati. Un passo di 2^(1/4) cambia il numero
+         * di celle di circa 1,4 volte per scalino, e permette di avvicinarsi.
+         */
+        final double PASSO = Math.pow(2, 0.25);
+        double grezzo = span / Math.sqrt(max);
+        double lato = Math.pow(PASSO, Math.round(Math.log(grezzo) / Math.log(PASSO)));
+
+        // Si allarga finche' le celle occupate stanno sotto il tetto.
+        List<GtfsIndexService.Stop> migliore = null;
+        for (int giro = 0; giro < 40 && migliore == null; giro++) {
+            List<GtfsIndexService.Stop> tentativo = unaPerCella(stops, lato);
+            if (tentativo.size() <= max) {
+                migliore = tentativo;
+            } else {
+                lato *= PASSO;
+            }
+        }
+        if (migliore == null) {
+            return stops.subList(0, Math.min(max, stops.size()));
+        }
+
+        // Poi si stringe finche' ci si sta ancora dentro, per non sprecare il
+        // budget. Resta deterministico: stesso insieme in ingresso, stesso lato.
+        for (int giro = 0; giro < 8; giro++) {
+            List<GtfsIndexService.Stop> piuFitto = unaPerCella(stops, lato / PASSO);
+            if (piuFitto.size() > max) break;
+            lato /= PASSO;
+            migliore = piuFitto;
+        }
+        return migliore;
+    }
+
+    /** Una fermata per cella di lato {@code lato}, in ordine stabile. */
+    private List<GtfsIndexService.Stop> unaPerCella(List<GtfsIndexService.Stop> stops, double lato) {
+        LinkedHashMap<Long, GtfsIndexService.Stop> perCella = new LinkedHashMap<>();
+        for (GtfsIndexService.Stop s : stops) {
+            long ry = (long) Math.floor(s.lat().doubleValue() / lato);
+            long rx = (long) Math.floor(s.lon().doubleValue() / lato);
+            perCella.putIfAbsent(ry * 1_000_003L + rx, s);
+        }
+        return List.copyOf(perCella.values());
     }
 
     /**
