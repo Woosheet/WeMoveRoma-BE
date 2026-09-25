@@ -32,9 +32,20 @@ public class ServiceAlertsService {
     private final Object refreshLock = new Object();
     private static final ZoneId ROME = ZoneId.of("Europe/Rome");
 
-    /** Severities GTFS-RT che fanno scattare la push. Default = SEVERE + WARNING. */
-    @Value("${notifications.alerts.severities:SEVERE,WARNING}")
+    /**
+     * Severita' che fanno scattare la push, applicate alla severita' <b>effettiva</b>
+     * (quella del feed se c'e', altrimenti quella derivata dall'effetto).
+     * Default = solo SEVERE: servizio sospeso o fermate non servite.
+     */
+    @Value("${notifications.alerts.severities:SEVERE}")
     private String alertSeveritiesCsv;
+
+    /**
+     * Un avviso che tocca almeno N linee passa comunque, qualunque sia la severita':
+     * riguarda la rete, non una linea sola. Zero disattiva la regola.
+     */
+    @Value("${notifications.alerts.min-routes-for-push:5}")
+    private int minRoutesForPush;
 
     /** Numero massimo di push per refresh: backstop anti-flood. */
     @Value("${notifications.alerts.max-per-refresh:5}")
@@ -202,13 +213,7 @@ public class ServiceAlertsService {
             if (id == null || id.isBlank()) continue;
             if (!sentThisCycle.add(id)) continue;
 
-            // NB: qui si guarda la severita' DICHIARATA dal feed, non quella derivata
-            // dall'effetto che l'API di lettura espone (AlertSeverityResolver).
-            // Il feed di Roma non dichiara mai la severita', quindi oggi questo filtro
-            // blocca tutto: e' voluto. Usare la severita' derivata renderebbe
-            // notificabili 112 avvisi su 115 — quasi tutti deviazioni per lavori —
-            // cioe' spam. Allargare le push e' una decisione a se', con criteri suoi.
-            if (!wanted.isEmpty() && (dto.getSeverita() == null || !wanted.contains(dto.getSeverita().toUpperCase(Locale.ROOT)))) {
+            if (!daNotificare(dto, wanted, minRoutesForPush)) {
                 continue;
             }
             // Key dispatch: id+inizio_epoch — un alert con stesso id ma diverso
@@ -230,6 +235,45 @@ public class ServiceAlertsService {
         }
     }
 
+    /**
+     * Chi merita una push sul topic generale, che arriva a tutti.
+     *
+     * <p>Il feed di Roma non dichiara mai {@code severity_level}: filtrare sulla
+     * severita' dichiarata, come si faceva prima, voleva dire non spedire mai
+     * niente. Filtrare su quella derivata e basta sarebbe l'errore opposto: 113
+     * avvisi su 116 sono WARNING (misurato il 18/09/2026), quasi tutti deviazioni
+     * per lavori su una linea sola, e chi prende un'altra linea riceverebbe una
+     * notifica che non lo riguarda.
+     *
+     * <p>Passano quindi due cose sole:
+     * <ul>
+     *   <li>la severita' effettiva richiesta — di default SEVERE, cioe' servizio
+     *       sospeso o fermate non servite: chi aspetta deve cambiare piano;</li>
+     *   <li>gli avvisi che toccano almeno {@code min-routes-for-push} linee, che
+     *       riguardano la rete e non un percorso singolo (6 su 116 alla stessa
+     *       misura).</li>
+     * </ul>
+     *
+     * <p>Le deviazioni della propria linea restano una cosa da notificare a chi
+     * quella linea la segue davvero, cioe' con i topic per linea e per fermata:
+     * sono un lavoro a se', non un allargamento di questo filtro.
+     */
+    static boolean daNotificare(ServiceAlertDTO dto, Set<String> wanted, int minRoutesForPush) {
+        int linee = dto.getRouteIds() == null ? 0 : dto.getRouteIds().size();
+        if (minRoutesForPush > 0 && linee >= minRoutesForPush) {
+            return true;
+        }
+        if (wanted.isEmpty()) {
+            return true;
+        }
+        return wanted.contains(severitaEffettiva(dto).toUpperCase(Locale.ROOT));
+    }
+
+    /** Severita' del feed se c'e', altrimenti quella derivata dall'effetto. */
+    private static String severitaEffettiva(ServiceAlertDTO dto) {
+        return AlertSeverityResolver.resolve(dto.getSeverita(), dto.getEffettoCodice());
+    }
+
     private static Set<String> parseSeverities(String csv) {
         if (csv == null || csv.isBlank()) return Set.of();
         Set<String> out = new HashSet<>();
@@ -248,7 +292,7 @@ public class ServiceAlertsService {
      *   🚨 Servizio sospeso (se non ci sono routes)
      */
     private static String buildPushTitle(ServiceAlertDTO dto) {
-        String prefix = "SEVERE".equalsIgnoreCase(dto.getSeverita()) ? "🚨 " : "⚠️ ";
+        String prefix = "SEVERE".equalsIgnoreCase(severitaEffettiva(dto)) ? "🚨 " : "⚠️ ";
         String routesPart = routesShort(dto.getRouteIds());
         String effetto = dto.getEffetto();
         if (effetto == null || effetto.isBlank()) {
@@ -300,7 +344,10 @@ public class ServiceAlertsService {
         if (dto.getRouteIds() != null && !dto.getRouteIds().isEmpty()) {
             out.put("routes", String.join(",", dto.getRouteIds()));
         }
-        if (dto.getSeverita() != null) out.put("severity", dto.getSeverita());
+        // Severita' effettiva, la stessa che l'app mostra in lista, piu' la sua
+        // provenienza: una push non deve dire "SEVERE" quando l'API dice altro.
+        out.put("severity", severitaEffettiva(dto));
+        out.put("severitySource", AlertSeverityResolver.source(dto.getSeverita()));
         // Deep link interno: la app potra' aprirlo direttamente sulla schermata Avvisi.
         out.put("deeplink", "wemoveroma://alerts");
         return out;

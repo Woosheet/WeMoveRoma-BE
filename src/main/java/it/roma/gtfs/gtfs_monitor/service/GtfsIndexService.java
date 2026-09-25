@@ -1188,6 +1188,11 @@ public class GtfsIndexService {
                 partenze.add(s.startTimeSeconds());
             }
         }
+        return componiOrari(partenze, serviceDate);
+    }
+
+    /** Prima, ultima, quante e ogni quanto, da un elenco di partenze in secondi. */
+    private static LineSchedule componiOrari(List<Integer> partenze, LocalDate serviceDate) {
         if (partenze.isEmpty()) {
             return null;
         }
@@ -1216,6 +1221,141 @@ public class GtfsIndexService {
                 partenze.size(),
                 intervallo
         );
+    }
+
+    /**
+     * Orari di tutta la rete <b>fermata per fermata</b> in una giornata: per ogni
+     * palina, e per ogni linea che ci passa, prima corsa, ultima e intervallo
+     * tipico <i>a quella fermata</i>.
+     *
+     * <h3>Perche' non bastavano quelli della linea</h3>
+     * Le pagine delle fermate mostravano gli orari della direzione, cioe' quelli
+     * del capolinea: su /fermata/nazionale-torino la linea 40 risultava con prima
+     * corsa alle 06:06, mentre alla palina 70084 la prima e' alle 06:47. Su una
+     * linea lunga lo scarto e' di tre quarti d'ora, e chi legge lo prende per
+     * l'orario della sua fermata.
+     *
+     * <h3>Costo</h3>
+     * Una passata sull'indice per-data gia' costruito (~900.000 righe), senza
+     * rileggere stop_times: le righe hanno gia' dentro la corsa e l'orario. Serve
+     * a chi genera le pagine statiche, che lo chiede tre volte — feriale, sabato,
+     * festivo — non a ogni richiesta di un utente.
+     *
+     * <p>I secondi restano quelli del GTFS e possono superare le 24 ore: una corsa
+     * delle 2 di notte appartiene al giorno prima ed e' scritta 26:00. Riportarli
+     * nell'arco delle 24 ore spetta a chi presenta il dato, che e' l'unico a sapere
+     * se scrivere "02:00" o "02:00 del giorno dopo".
+     */
+    public List<StopSchedule> stopSchedules(LocalDate serviceDate) {
+        if (serviceDate == null) {
+            return List.of();
+        }
+        long generazione = rebuildGeneration.get();
+        OrariMemo memo = orariMemo;
+        if (memo.generation() == generazione) {
+            List<StopSchedule> pronti = memo.perData().get(serviceDate);
+            if (pronti != null) return pronti;
+        }
+        // Un calcolo alla volta: ognuno tiene in memoria un indice da decine di MB,
+        // e due in parallelo su un heap da 768 MB sono gia' un rischio.
+        synchronized (orariMemoLock) {
+            generazione = rebuildGeneration.get();
+            memo = orariMemo.generation() == generazione ? orariMemo : new OrariMemo(generazione, Map.of());
+            List<StopSchedule> pronti = memo.perData().get(serviceDate);
+            if (pronti != null) return pronti;
+
+            List<StopSchedule> calcolati = List.copyOf(calcolaOrariPerFermata(serviceDate));
+            // Se nel frattempo il feed e' cambiato, il risultato vale per questa
+            // risposta ma non va tenuto: e' costruito sui dati vecchi.
+            if (rebuildGeneration.get() == generazione) {
+                Map<LocalDate, List<StopSchedule>> prossimo = new LinkedHashMap<>(memo.perData());
+                prossimo.put(serviceDate, calcolati);
+                while (prossimo.size() > ORARI_MEMO_MASSIMO) {
+                    prossimo.remove(prossimo.keySet().iterator().next());
+                }
+                orariMemo = new OrariMemo(generazione, prossimo);
+            }
+            return calcolati;
+        }
+    }
+
+    /**
+     * Risultati gia' calcolati, per data, validi finche' il feed non cambia.
+     *
+     * Il generatore delle pagine chiede tre date a notte; tenerne quattro basta e
+     * sta in una decina di MB. Oltre, una data nuova sostituisce la piu' vecchia.
+     */
+    private record OrariMemo(long generation, Map<LocalDate, List<StopSchedule>> perData) {}
+    private static final int ORARI_MEMO_MASSIMO = 4;
+    private final Object orariMemoLock = new Object();
+    private volatile OrariMemo orariMemo = new OrariMemo(-1, Map.of());
+
+    /**
+     * Il calcolo vero, <b>senza passare dalla cache degli indici per-data</b>.
+     *
+     * Quella cache tiene solo il giorno richiesto e i due adiacenti: chiederle una
+     * data fra dodici giorni buttava fuori l'indice di oggi, e ogni richiesta dopo
+     * — arrivi, fermate vicine — lo ricostruiva da capo. Misurato in locale il
+     * 25/09/2026: fermate vicine da 0,015 s a 3–6 s dopo una sola chiamata. Qui la
+     * cache si legge se la data c'e' gia'; altrimenti l'indice si costruisce a
+     * parte e si butta via finito il conto.
+     */
+    private List<StopSchedule> calcolaOrariPerFermata(LocalDate serviceDate) {
+        Indexes indexes = ref.get();
+        ScheduledStopIndex inCache = scheduledByDateRef.get().get(serviceDate);
+        Map<String, List<ScheduledStopTime>> perFermata = inCache != null
+                ? inCache.byStopId()
+                : buildPerDateIndexes(serviceDate).scheduled().byStopId();
+        if (perFermata.isEmpty()) {
+            return List.of();
+        }
+
+        long t0 = System.nanoTime();
+        List<StopSchedule> out = new ArrayList<>();
+        for (Map.Entry<String, List<ScheduledStopTime>> fermata : perFermata.entrySet()) {
+            // Chiave di raggruppamento uguale a quella di linePatterns: direzione +
+            // capolinea. Cosi' le due fonti si incastrano senza bisogno di indovinare.
+            Map<String, List<Integer>> gruppi = new LinkedHashMap<>();
+            Map<String, Trip> primoTrip = new HashMap<>();
+            // Una corsa che tocca due volte la stessa palina conta una volta sola:
+            // sul 40, che parte e torna a Termini, le 171 corse diventavano 342 e
+            // la pagina prometteva un bus ogni 4 minuti invece che ogni 6. Vale la
+            // prima volta, che e' la partenza; la seconda e' il rientro.
+            Map<String, Integer> giaViste = new HashMap<>();
+            for (ScheduledStopTime riga : fermata.getValue()) {
+                Trip trip = indexes.trips().get(riga.tripId());
+                if (trip == null) continue;
+                String linea = publicLineByRouteId(trip.routeId());
+                if (linea == null || linea.isBlank()) continue;
+                String chiave = linea + "|" + (trip.directionId() == null ? "?" : trip.directionId())
+                        + "|" + (trip.headsign() == null ? "" : trip.headsign());
+                // La partenza e' quella che interessa a chi aspetta: l'arrivo si usa
+                // solo se il feed non dichiara la partenza.
+                int quando = riga.departureTimeSeconds() >= 0 ? riga.departureTimeSeconds() : riga.arrivalTimeSeconds();
+                if (quando < 0) continue;
+                String perCorsa = chiave + "|" + riga.tripId();
+                Integer vista = giaViste.get(perCorsa);
+                if (vista != null && vista <= quando) continue;
+                giaViste.put(perCorsa, quando);
+                gruppi.computeIfAbsent(chiave, k -> new ArrayList<>(8)).add(quando);
+                primoTrip.putIfAbsent(chiave, trip);
+            }
+            for (Map.Entry<String, List<Integer>> gruppo : gruppi.entrySet()) {
+                LineSchedule orari = componiOrari(gruppo.getValue(), serviceDate);
+                if (orari == null) continue;
+                Trip trip = primoTrip.get(gruppo.getKey());
+                out.add(new StopSchedule(
+                        fermata.getKey(),
+                        publicLineByRouteId(trip.routeId()),
+                        trip.directionId(),
+                        trip.headsign(),
+                        orari
+                ));
+            }
+        }
+        log.info("[GTFS-Index] Orari per fermata {}: {} combinazioni fermata+direzione in {} ms",
+                serviceDate, out.size(), (System.nanoTime() - t0) / 1_000_000);
+        return out;
     }
 
     /**
@@ -1847,5 +1987,19 @@ public class GtfsIndexService {
             Double lon,
             Instant arrivalTime,
             Instant departureTime
+    ) {}
+
+    /**
+     * Orario di una linea a una fermata precisa, in una giornata.
+     *
+     * Direzione e capolinea servono a riconoscere il verso: la stessa palina puo'
+     * essere servita dalla stessa linea nei due sensi, con orari diversi.
+     */
+    public record StopSchedule(
+            String stopId,
+            String line,
+            Integer directionId,
+            String headsign,
+            LineSchedule schedule
     ) {}
 }

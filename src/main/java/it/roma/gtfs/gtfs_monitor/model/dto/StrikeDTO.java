@@ -26,6 +26,12 @@ public class StrikeDTO {
     private String categoria;
     private LocalDate dataProclamazione;
     private LocalDate dataRicezione;
-    /** URL canonico al dettaglio sciopero (http://scioperi.mit.gov.it/NNNN). */
+    /**
+     * Pagina del registro, cosi' come la dichiara il feed.
+     *
+     * E' la home di scioperi.mit.gov.it, uguale per tutti: una pagina di
+     * dettaglio per singolo sciopero non esiste. L'indirizzo che si potrebbe
+     * ricavare dal guid (.../8553) risponde 404 — verificato il 18/09/2026.
+     */
     private String link;
 }

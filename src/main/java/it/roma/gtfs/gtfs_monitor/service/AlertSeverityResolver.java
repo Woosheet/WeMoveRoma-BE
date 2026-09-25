@@ -43,12 +43,12 @@ import java.util.Map;
  * cambiare un'etichetta in {@code ServiceAlertsService.EFFECT_IT} non deve poter
  * spostare in silenzio la severita' di un avviso.
  *
- * <p><b>Ambito deliberatamente limitato all'API di lettura.</b> Il filtro delle push
- * ({@code notifications.alerts.severities=SEVERE,WARNING} in
- * {@code ServiceAlertsService}) continua a leggere la severita' <i>dichiarata</i>:
- * applicare li' quella derivata trasformerebbe 112 avvisi su 115 in candidati alla
- * notifica, cioe' spam. Un eventuale allargamento delle push va deciso a parte, con
- * criteri suoi.
+ * <p><b>Vale anche per le push</b>, da settembre 2026: {@code ServiceAlertsService}
+ * filtra sulla severita' che esce da qui, non piu' su quella dichiarata — che a Roma
+ * non arriva mai e bloccava ogni notifica. Il filtro pero' li' e' stretto
+ * ({@code notifications.alerts.severities=SEVERE}), perche' la severita' derivata da
+ * sola non basta a decidere: WARNING copre 113 avvisi su 116, quasi tutti deviazioni
+ * per lavori su una linea sola.
  */
 public final class AlertSeverityResolver {
 

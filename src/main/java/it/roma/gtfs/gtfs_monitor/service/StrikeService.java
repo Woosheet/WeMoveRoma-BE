@@ -184,15 +184,37 @@ public class StrikeService {
     }
 
     private List<StrikeDTO> filter(List<StrikeDTO> all) {
-        List<String> sectors = csvLower(sectorsCsv);
-        List<String> regions = csvLower(regionsCsv);
+        return filtra(all, csvLower(sectorsCsv), csvLower(regionsCsv));
+    }
+
+    /**
+     * Quali scioperi del registro riguardano chi si muove a Roma.
+     *
+     * <h3>Il settore</h3>
+     * Il registro ne usa una decina — aereo, marittimo, elicotteri, merci — e
+     * quasi nessuno ferma un bus. Restano il trasporto pubblico locale, quello
+     * ferroviario (le FL sono nel planner) e gli scioperi <b>generali</b> o
+     * <b>plurisettoriali</b>, che sono poi quelli che fermano la citta' davvero.
+     * "Appalti ferroviari" resta fuori: sono ditte in appalto — pulizie,
+     * ristorazione, portierato — che non fermano le corse.
+     *
+     * <h3>La regione</h3>
+     * Non basta guardare il campo Regione. Il 18/09/2026 il registro conteneva
+     * uno sciopero generale nazionale del 30 ottobre con Regione = Toscana e
+     * Rilevanza = Nazionale: filtrando sulla sola regione sparirebbe, mentre uno
+     * sciopero generale nazionale ferma anche Roma. Vale quindi la rilevanza
+     * dichiarata dal Ministero quando dice "Nazionale", e altrimenti la regione.
+     */
+    static List<StrikeDTO> filtra(List<StrikeDTO> all, List<String> settori, List<String> regioni) {
         List<StrikeDTO> out = new ArrayList<>();
         for (StrikeDTO s : all) {
             String sec = s.getSettore() == null ? "" : s.getSettore().toLowerCase(Locale.ROOT);
             String reg = s.getRegione() == null ? "" : s.getRegione().toLowerCase(Locale.ROOT).trim();
-            boolean sectorMatch = sectors.isEmpty() || sectors.stream().anyMatch(sec::contains);
-            boolean regionMatch = regions.isEmpty() || regions.stream().anyMatch(reg::contains);
-            if (sectorMatch && regionMatch) {
+            String ril = s.getRilevanza() == null ? "" : s.getRilevanza().toLowerCase(Locale.ROOT).trim();
+            boolean settoreOk = settori.isEmpty() || settori.stream().anyMatch(sec::contains);
+            boolean regioneOk = regioni.isEmpty() || regioni.stream().anyMatch(reg::contains)
+                    || ril.equals("nazionale");
+            if (settoreOk && regioneOk) {
                 out.add(s);
             }
         }
