@@ -103,6 +103,17 @@ public class TripUpdatesService {
         return List.copyOf(out);
     }
 
+    /**
+     * L'ultima istantanea gia' in cache, senza mai scatenare un download.
+     *
+     * Per chi la legge con un ritmo proprio (PunctualityService): passare da
+     * fetch() potrebbe avviare un refresh fuori turno, cioe' un poll in piu'
+     * verso romamobilita.it, che ha un filtro anti-bot.
+     */
+    public List<TripUpdateDTO> snapshot() {
+        return cacheRef.get().data();
+    }
+
     @Scheduled(
             fixedDelayString = "${gtfs.realtime.refresh-millis:5000}",
             initialDelayString = "${gtfs.realtime.refresh-millis:5000}"

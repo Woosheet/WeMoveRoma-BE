@@ -21,6 +21,11 @@ services:
       GTFS_STATIC_DATADIR: "/app/data/gtfs_static"
       GTFS_STATIC_REFRESHMILLIS: "3600000"
 
+      # Storico su Postgres. La password sta nel file .env accanto a questo file.
+      DB_URL: "jdbc:postgresql://postgres:5432/wemoveroma"
+      DB_USERNAME: "wemoveroma"
+      DB_PASSWORD: "${POSTGRES_PASSWORD:-}"
+
       GTFS_REALTIME_TRIPUPDATESURL: "https://romamobilita.it/wp-content/uploads/shared/rome_rtgtfs_trip_updates_feed.pb"
       GTFS_REALTIME_VEHICLEPOSITIONSURL: "https://romamobilita.it/wp-content/uploads/shared/rome_rtgtfs_vehicle_positions_feed.pb"
       GTFS_REALTIME_SERVICEALERTSURL: "https://romamobilita.it/wp-content/uploads/shared/rome_rtgtfs_service_alerts_feed.pb"
@@ -31,3 +36,18 @@ services:
     entrypoint: >
       sh -c "java $JAVA_OPTS -jar /app/app.jar --server.port=8080"
       
+
+  # Storico del servizio osservato (passaggi alle fermate, corse). Nessuna porta
+  # pubblicata: ci parla solo il backend, sulla rete interna del compose.
+  # Il volume e' tutto lo storico: va incluso nei backup (pg_dump).
+  postgres:
+    image: postgres:18
+    container_name: wemoveroma-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "wemoveroma"
+      POSTGRES_USER: "wemoveroma"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-}"
+    volumes:
+      # Da Postgres 18 l'immagine vuole montata la cartella padre, non .../data.
+      - ./data/postgres:/var/lib/postgresql
