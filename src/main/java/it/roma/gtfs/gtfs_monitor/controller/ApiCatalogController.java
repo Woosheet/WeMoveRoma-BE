@@ -3,9 +3,12 @@ package it.roma.gtfs.gtfs_monitor.controller;
 import it.roma.gtfs.gtfs_monitor.config.ResourceNotFoundException;
 import it.roma.gtfs.gtfs_monitor.model.dto.ApiLinePatternDTO;
 import it.roma.gtfs.gtfs_monitor.model.dto.ApiLinePunctualityDTO;
+import it.roma.gtfs.gtfs_monitor.model.dto.ApiSlowSegmentsDTO;
 import it.roma.gtfs.gtfs_monitor.model.dto.ApiStopSchedulesDTO;
 import it.roma.gtfs.gtfs_monitor.service.GtfsIndexService;
 import it.roma.gtfs.gtfs_monitor.service.PunctualityService;
+import it.roma.gtfs.gtfs_monitor.service.ServiceDayType;
+import it.roma.gtfs.gtfs_monitor.service.SlowSegmentsService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -31,6 +34,7 @@ public class ApiCatalogController {
 
     private final GtfsIndexService gtfsIndexService;
     private final PunctualityService punctualityService;
+    private final SlowSegmentsService slowSegmentsService;
 
     @GetMapping("/lines")
     public List<String> lines() {
@@ -164,6 +168,54 @@ public class ApiCatalogController {
         return punctualityService.riepilogo(line, dal, al)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
                         "Storico della puntualita' non disponibile"));
+    }
+
+    /**
+     * Dove i bus perdono tempo: i tratti fra due fermate in cui le corse
+     * accumulano ritardo, con la strada da disegnare. Vedi SlowSegmentsService.
+     *
+     * dayType: feriale (predefinito), sabato, festivo. band: tutte (predefinito),
+     * mattina (7-10), resto, sera (16-20). line: solo i tratti su cui passa quella
+     * linea (404 se la linea non esiste). Senza date, i 28 giorni fino a ieri:
+     * oggi non e' ancora aggregato. Un periodo senza giorni di quel tipo, o
+     * senza dati, risponde con l'elenco vuoto e days = 0.
+     *
+     * 400 per parametri non validi o date oltre la conservazione, 503 se lo
+     * storico non e' raggiungibile.
+     */
+    @GetMapping("/slow-segments")
+    public ApiSlowSegmentsDTO slowSegments(
+            @RequestParam(defaultValue = ServiceDayType.FERIALE) String dayType,
+            @RequestParam(defaultValue = SlowSegmentsService.TUTTE) String band,
+            @RequestParam(required = false) String line,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to) {
+        if (!gtfsIndexService.isStaticDataLoaded()) {
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                    "Dati GTFS non ancora caricati, riprovare tra qualche istante");
+        }
+        if (!ServiceDayType.TUTTI.contains(dayType)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "dayType: " + ServiceDayType.TUTTI);
+        }
+        if (!band.equals(SlowSegmentsService.TUTTE) && !SlowSegmentsService.FASCE.contains(band)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "band: " + SlowSegmentsService.TUTTE + ", " + SlowSegmentsService.FASCE);
+        }
+        String linea = line == null || line.isBlank() ? null : line.trim();
+        if (linea != null && gtfsIndexService.routeIdsByPublicLine(linea).isEmpty()) {
+            throw new ResourceNotFoundException("Linea", linea);
+        }
+        LocalDate oggi = PunctualityService.oggi();
+        LocalDate al = to != null ? to : oggi.minusDays(1);
+        LocalDate dal = from != null ? from : al.minusDays(27);
+        LocalDate primo = oggi.minusDays(slowSegmentsService.giorniConservati());
+        if (dal.isAfter(al) || al.isAfter(oggi) || dal.isBefore(primo)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Intervallo non valido: from <= to, dal " + primo + " a oggi");
+        }
+        return slowSegmentsService.tratti(dayType, band, dal, al, linea)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                        "Storico dei tratti non disponibile"));
     }
 
     @GetMapping("/destinations")

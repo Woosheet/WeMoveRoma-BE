@@ -72,8 +72,8 @@ public class JourneyPlannerService {
                           ... on Stop { name lat lon }
                         }
                       }
-                      start { estimated { time } }
-                      end { estimated { time } }
+                      start { scheduledTime estimated { time } }
+                      end { scheduledTime estimated { time } }
                       duration
                     }
                   }
@@ -301,8 +301,10 @@ public class JourneyPlannerService {
                     .filter(o -> o.legs() != null && !o.legs().isEmpty())
                     .toList();
         } catch (Exception e) {
-            log.warn("[JourneyPlanner] OTP GraphQL request failed for {} -> {} (window={}): {}",
-                    fromLabel, toLabel, windowIso, e.toString(), e);
+            // Niente etichette di partenza/arrivo: spesso sono indirizzi scelti
+            // dall'utente (PRIVACY_POLICY.md §2.3, §6).
+            log.warn("[JourneyPlanner] OTP GraphQL request failed (window={}): {}",
+                    windowIso, e.toString(), e);
             return null;
         }
     }
@@ -531,14 +533,18 @@ public class JourneyPlannerService {
         return (int) Math.max(0, Math.round(n.doubleValue() / 60.0));
     }
 
+    /**
+     * Orario di una tratta: quello stimato se OTP ha il realtime, altrimenti quello
+     * programmato. "estimated" da solo e' null per tutte le corse senza realtime
+     * (treni, e i bus quando il feed manca): le tratte uscivano senza orario e il
+     * client doveva ricostruirlo sommando le durate, perdendo le attese ai cambi.
+     */
     @SuppressWarnings("unchecked")
     private static String legTimeToIso(Object legTimeObj) {
         if (!(legTimeObj instanceof Map<?, ?> raw)) return null;
         Map<String, Object> legTime = (Map<String, Object>) raw;
-        Object estimated = legTime.get("estimated");
-        String e = timeHolderToIso(estimated);
-        if (e != null) return e;
-        return null;
+        String estimated = timeHolderToIso(legTime.get("estimated"));
+        return estimated != null ? estimated : toStringOrNull(legTime.get("scheduledTime"));
     }
 
     @SuppressWarnings("unchecked")

@@ -103,7 +103,10 @@ public class GeocodeSearchService {
             searchCache.put(cacheKey, new TimedValue<>(results, System.currentTimeMillis()));
             return results;
         } catch (Exception e) {
-            log.warn("[GeocodeSearch] failed q='{}': {}", q, e.toString(), e);
+            // Mai il testo cercato nei log, qui e nelle fetch sotto: e' spesso un
+            // indirizzo dell'utente (PRIVACY_POLICY.md §2.3, §6). Le eccezioni di
+            // WebClient invece si possono loggare: Spring toglie la query dall'URL.
+            log.warn("[GeocodeSearch] failed: {}", e.toString(), e);
             List<GeocodeSearchResultDTO> staleResult = getCached(searchCache, cacheKey, Long.MAX_VALUE);
             if (staleResult != null) {
                 return staleResult;
@@ -166,7 +169,7 @@ public class GeocodeSearchService {
                 .queryParam("countrycodes", "it")
                 .queryParam("viewbox", "%s,%s,%s,%s".formatted(ROME_MIN_LON, ROME_MAX_LAT, ROME_MAX_LON, ROME_MIN_LAT))
                 .queryParam("bounded", bounded ? 1 : 0)
-                .build(), query);
+                .build());
     }
 
     /**
@@ -192,7 +195,7 @@ public class GeocodeSearchService {
                 .queryParam("countrycodes", "it")
                 .queryParam("viewbox", "%s,%s,%s,%s".formatted(ROME_MIN_LON, ROME_MAX_LAT, ROME_MAX_LON, ROME_MIN_LAT))
                 .queryParam("bounded", bounded ? 1 : 0)
-                .build(), "street=" + streetParam + "&city=" + cityParam);
+                .build());
     }
 
     /**
@@ -245,16 +248,15 @@ public class GeocodeSearchService {
         } catch (WebClientResponseException.TooManyRequests e) {
             List<Map<String, Object>> stale = getCached(upstreamCache, cacheKey, Long.MAX_VALUE);
             if (stale != null) {
-                log.warn("[GeocodeSearch][Photon] 429 for '{}', using stale cache ({} result(s))",
-                        query, stale.size());
+                log.warn("[GeocodeSearch][Photon] 429, using stale cache ({} result(s))", stale.size());
                 return new VariantFetch(stale, true);
             }
-            log.warn("[GeocodeSearch][Photon] 429 for '{}', no cached fallback", query);
+            log.warn("[GeocodeSearch][Photon] 429, no cached fallback");
             return new VariantFetch(List.of(), true);
         } catch (Exception e) {
             // Photon è un servizio terzo: in caso di errore non blocchiamo la pipeline,
             // proseguiamo con Nominatim e usiamo eventualmente la cache stale di Photon.
-            log.warn("[GeocodeSearch][Photon] failed for '{}': {}", query, e.toString());
+            log.warn("[GeocodeSearch][Photon] failed: {}", e.toString());
             List<Map<String, Object>> stale = getCached(upstreamCache, cacheKey, Long.MAX_VALUE);
             if (stale != null) {
                 return new VariantFetch(stale, false);
@@ -376,7 +378,7 @@ public class GeocodeSearchService {
     }
 
     @SuppressWarnings("unchecked")
-    private VariantFetch doFetch(String cacheKey, Function<UriBuilder, java.net.URI> uri, String description) {
+    private VariantFetch doFetch(String cacheKey, Function<UriBuilder, java.net.URI> uri) {
         try {
             List<Map<String, Object>> payload = webClient.get()
                     .uri(uri::apply)
@@ -390,12 +392,11 @@ public class GeocodeSearchService {
         } catch (WebClientResponseException.TooManyRequests e) {
             List<Map<String, Object>> stalePayload = getCached(upstreamCache, cacheKey, Long.MAX_VALUE);
             if (stalePayload != null) {
-                log.warn("[GeocodeSearch] 429 from Nominatim for '{}', using stale upstream cache with {} result(s)",
-                        description,
+                log.warn("[GeocodeSearch] 429 from Nominatim, using stale upstream cache with {} result(s)",
                         stalePayload.size());
                 return new VariantFetch(stalePayload, true);
             }
-            log.warn("[GeocodeSearch] 429 from Nominatim for '{}', no cached fallback available", description);
+            log.warn("[GeocodeSearch] 429 from Nominatim, no cached fallback available");
             return new VariantFetch(List.of(), true);
         }
     }

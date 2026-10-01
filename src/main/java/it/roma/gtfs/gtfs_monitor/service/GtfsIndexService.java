@@ -312,6 +312,146 @@ public class GtfsIndexService {
         return ref.get().shapesById().getOrDefault(trip.shapeId(), List.of());
     }
 
+    /** Distanza massima fra una fermata e il punto del tracciato a cui si aggancia. */
+    static final double AGGANCIO_MASSIMO_M = 80;
+    /** Fra le due fermate di un tratto, al massimo mezz'ora di corsa. */
+    private static final int TRATTO_MASSIMO_SEC = 30 * 60;
+    /** Tracciati diversi da provare per un tratto prima di arrendersi. */
+    private static final int TENTATIVI_TRATTO = 5;
+
+    /**
+     * La strada che un bus fa dalla fermata {@code da} alla fermata {@code a}, come
+     * coppie [lon, lat]. Serve alla mappa dei tratti in cui si perde tempo
+     * (SlowSegmentsService).
+     *
+     * Si cerca una corsa programmata che passi da tutte e due, in quell'ordine ed
+     * entro mezz'ora, e le fermate si agganciano al punto piu' vicino del suo
+     * tracciato. Non si usa shape_dist_traveled: i tracciati in memoria non lo
+     * hanno, e nel feed ATAC manca comunque in centinaia di migliaia di righe.
+     *
+     * Le corse si prendono dall'indice del giorno indicato, e poi da quelli di
+     * altri giorni gia' in cache, senza costruirne: una linea solo feriale la
+     * domenica non c'e', ma l'indice di sabato o di lunedi' di solito si'. Chiedere
+     * una data nuova costerebbe una scansione di stop_times e spingerebbe fuori
+     * dalla cache l'indice di un altro giorno.
+     *
+     * Vuoto se nessuna corsa passa da entrambe o il tracciato e' troppo lontano
+     * dalle fermate: la linea dritta, se serve, la decide chi chiama.
+     */
+    public List<double[]> shapeBetweenStops(String da, String a, LocalDate serviceDate) {
+        Indexes indexes = ref.get();
+        Stop fermataDa = indexes.stops().get(da);
+        Stop fermataA = indexes.stops().get(a);
+        if (fermataDa == null || fermataA == null || fermataDa.lat() == null || fermataDa.lon() == null
+                || fermataA.lat() == null || fermataA.lon() == null) {
+            return List.of();
+        }
+        List<ScheduledStopIndex> indici = new ArrayList<>();
+        indici.add(scheduledStopIndexForDate(serviceDate));
+        scheduledByDateRef.get().forEach((data, indice) -> {
+            if (!data.equals(serviceDate)) indici.add(indice);
+        });
+
+        Set<String> tracciatiProvati = new HashSet<>();
+        for (ScheduledStopIndex indice : indici) {
+            List<ScheduledStopTime> passaggiDa = indice.byStopId().getOrDefault(da, List.of());
+            List<ScheduledStopTime> passaggiA = indice.byStopId().getOrDefault(a, List.of());
+            if (passaggiDa.isEmpty() || passaggiA.isEmpty()) {
+                continue;
+            }
+            Map<String, Integer> orarioA = new HashMap<>();
+            for (ScheduledStopTime p : passaggiA) {
+                orarioA.merge(p.tripId(), p.bestTimeSeconds(), Math::max);
+            }
+            for (ScheduledStopTime p : passaggiDa) {
+                Integer arrivo = orarioA.get(p.tripId());
+                if (arrivo == null || arrivo <= p.bestTimeSeconds() || arrivo - p.bestTimeSeconds() > TRATTO_MASSIMO_SEC) {
+                    continue;
+                }
+                Trip trip = indexes.trips().get(p.tripId());
+                if (trip == null || trip.shapeId() == null || !tracciatiProvati.add(trip.shapeId())) {
+                    continue;
+                }
+                List<double[]> tratto = ritaglia(indexes.shapesById().getOrDefault(trip.shapeId(), List.of()),
+                        fermataDa, fermataA);
+                if (!tratto.isEmpty()) {
+                    return tratto;
+                }
+                if (tracciatiProvati.size() >= TENTATIVI_TRATTO) {
+                    return List.of();
+                }
+            }
+        }
+        return List.of();
+    }
+
+    /**
+     * Il pezzo di tracciato fra due fermate: il punto piu' vicino alla prima, poi
+     * il piu' vicino alla seconda cercato dopo di lui (le linee circolari passano
+     * due volte vicino alla stessa fermata). Vuoto se una fermata e' lontana dal
+     * tracciato, o se il pezzo e' molto piu' lungo della distanza in linea d'aria:
+     * vorrebbe dire che si e' agganciato il passaggio sbagliato.
+     */
+    static List<double[]> ritaglia(List<ShapePoint> tracciato, Stop da, Stop a) {
+        int primo = piuVicino(tracciato, da, 0);
+        int ultimo = primo < 0 ? -1 : piuVicino(tracciato, a, primo);
+        if (primo < 0 || ultimo < 0) {
+            return List.of();
+        }
+        List<double[]> out = new ArrayList<>();
+        out.add(lonLat(da.lon(), da.lat()));
+        double lunghezza = 0;
+        for (int i = primo; i <= ultimo; i++) {
+            ShapePoint p = tracciato.get(i);
+            lunghezza += aggiungi(out, lonLat(p.lon(), p.lat()));
+        }
+        double[] fine = lonLat(a.lon(), a.lat());
+        lunghezza += aggiungi(out, fine);
+        double diretta = metri(out.getFirst(), fine);
+        if (lunghezza > Math.max(4 * diretta, diretta + 1500)) {
+            return List.of();
+        }
+        return out;
+    }
+
+    /** Aggiunge il punto se non e' uguale all'ultimo (fermata sopra un vertice); restituisce i metri in piu'. */
+    private static double aggiungi(List<double[]> strada, double[] punto) {
+        double[] ultimo = strada.getLast();
+        if (ultimo[0] == punto[0] && ultimo[1] == punto[1]) {
+            return 0;
+        }
+        strada.add(punto);
+        return metri(ultimo, punto);
+    }
+
+    private static int piuVicino(List<ShapePoint> tracciato, Stop fermata, int da) {
+        double[] f = {fermata.lon(), fermata.lat()};
+        int migliore = -1;
+        double distanzaMigliore = AGGANCIO_MASSIMO_M;
+        for (int i = da; i < tracciato.size(); i++) {
+            ShapePoint p = tracciato.get(i);
+            double d = metri(f, new double[]{p.lon(), p.lat()});
+            if (d < distanzaMigliore) {
+                distanzaMigliore = d;
+                migliore = i;
+            }
+        }
+        return migliore;
+    }
+
+    /** Cinque decimali: un metro, e un terzo dei byte sul filo. */
+    private static double[] lonLat(double lon, double lat) {
+        return new double[]{Math.round(lon * 1e5) / 1e5, Math.round(lat * 1e5) / 1e5};
+    }
+
+    /** Distanza in metri fra due punti [lon, lat], equirettangolare: a scala di tratto basta. */
+    public static double metri(double[] p, double[] q) {
+        double r = Math.PI / 180;
+        double x = (q[0] - p[0]) * r * Math.cos((p[1] + q[1]) / 2 * r);
+        double y = (q[1] - p[1]) * r;
+        return Math.hypot(x, y) * 6_371_000;
+    }
+
     /**
      * Linee servite da una fermata nella giornata di servizio indicata.
      *

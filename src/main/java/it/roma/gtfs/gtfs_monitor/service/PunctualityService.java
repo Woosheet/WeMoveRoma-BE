@@ -56,8 +56,9 @@ import java.util.regex.Pattern;
  * piu' dello storico.
  *
  * MANUTENZIONE, ogni ora: partizioni del mese in corso e del successivo,
- * aggregato dei due giorni precedenti in puntualita_giornaliera (idempotente),
- * eliminazione di passaggi e corse oltre i 90 giorni.
+ * aggregato dei due giorni precedenti in puntualita_giornaliera e in
+ * tratti_giornalieri (idempotenti, vedi SlowSegmentsService), eliminazione di
+ * passaggi e corse oltre i 90 giorni.
  */
 @Slf4j
 @Service
@@ -90,6 +91,7 @@ public class PunctualityService {
     private final GtfsIndexService indexService;
     private final JdbcTemplate jdbc;
     private final DataSource dataSource;
+    private final SlowSegmentsService slowSegments;
 
     @Value("${punctuality.enabled:true}")
     private boolean enabled;
@@ -107,6 +109,7 @@ public class PunctualityService {
     private long giri;
     private long ultimaManutenzioneMillis;
     private LocalDate ultimoGiornoAggregato;
+    private boolean trattiRecuperati;
 
     /** Passaggi di un giorno e di un'ora, gia' divisi per categoria. */
     record RigaOraria(LocalDate giorno, int ora, int campioni, int anticipo, int puntuale, int ritardo, int forteRitardo) {}
@@ -399,8 +402,9 @@ public class PunctualityService {
                     """,
                     ANTICIPO_SOTTO_SEC, ANTICIPO_SOTTO_SEC, RITARDO_DA_SEC, RITARDO_DA_SEC, FORTE_RITARDO_DA_SEC,
                     FORTE_RITARDO_DA_SEC, Date.valueOf(ieri.minusDays(1)), Date.valueOf(ieri));
-            ultimoGiornoAggregato = ieri;
             log.info("[Puntualita] aggregati {} e {}: {} righe", ieri.minusDays(1), ieri, righe);
+            aggregaTratti(ieri);
+            ultimoGiornoAggregato = ieri;
         }
 
         LocalDate limite = oggi().minusDays(GIORNI_CONSERVATI);
@@ -423,6 +427,37 @@ public class PunctualityService {
             }
         }
         jdbc.update("DELETE FROM corse_osservate WHERE giorno < ?", Date.valueOf(limite));
+    }
+
+    /**
+     * I tratti di ieri e dell'altro ieri, piu', al primo giro dopo l'avvio, i
+     * giorni dello storico che non hanno ancora l'aggregato: al rilascio sono
+     * tutti, poi i giorni in cui il backend era spento.
+     *
+     * Un errore qui non ferma il resto della manutenzione e non si ritenta ogni
+     * 15 secondi: e' una query pesante, e si riprova domani.
+     */
+    private void aggregaTratti(LocalDate ieri) {
+        try {
+            long inizio = System.currentTimeMillis();
+            List<LocalDate> giorni = new ArrayList<>();
+            if (!trattiRecuperati) {
+                giorni.addAll(slowSegments.giorniMancanti(ieri.minusDays(2)));
+            }
+            giorni.add(ieri.minusDays(1));
+            giorni.add(ieri);
+            int righe = 0;
+            for (LocalDate giorno : giorni) {
+                righe += slowSegments.aggregaGiorno(giorno);
+            }
+            trattiRecuperati = true;
+            int eliminate = slowSegments.eliminaVecchi(oggi());
+            log.info("[Puntualita] tratti di {} giorni ({} .. {}): {} righe in {} ms, {} eliminate",
+                    giorni.size(), giorni.getFirst(), giorni.getLast(), righe,
+                    System.currentTimeMillis() - inizio, eliminate);
+        } catch (DataAccessException e) {
+            avvisa("aggregato dei tratti fallito", e);
+        }
     }
 
     private void assicuraPartizione(YearMonth mese) {
