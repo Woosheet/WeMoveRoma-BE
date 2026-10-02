@@ -81,7 +81,11 @@ public class NearbyService {
                         stop.lat() >= minLat && stop.lat() <= maxLat &&
                         stop.lon() >= minLon && stop.lon() <= maxLon
                 ))
-                .sorted(Comparator.comparing(GtfsIndexService.Stop::name, String.CASE_INSENSITIVE_ORDER))
+                // Le paline senza nome nel feed vanno in fondo: un client che mostra
+                // solo i primi risultati non deve aprire l'elenco con "Fermata 30994",
+                // e nel diradamento la cella la vince una fermata con nome.
+                .sorted(Comparator.comparing(GtfsIndexService.Stop::placeholderName)
+                        .thenComparing(GtfsIndexService.Stop::name, String.CASE_INSENSITIVE_ORDER))
                 .toList();
 
         List<GtfsIndexService.Stop> scelte = candidate.size() <= max
@@ -292,7 +296,9 @@ public class NearbyService {
     private static int stopScore(GtfsIndexService.Stop stop, String normalizedQuery) {
         String id = normalizeText(stop.id());
         String code = normalizeText(stop.code());
-        String name = normalizeText(stop.name());
+        // Il segnaposto "Fermata <codice>" non e' un nome: cercando "fermata" non
+        // devono uscire le paline senza nome. Restano trovabili per codice.
+        String name = stop.placeholderName() ? null : normalizeText(stop.name());
         String desc = normalizeText(stop.desc());
 
         if (normalizedQuery.equals(id) || normalizedQuery.equals(code)) return 120;

@@ -5,6 +5,7 @@ import com.univocity.parsers.common.record.Record;
 import com.univocity.parsers.csv.CsvParser;
 import com.univocity.parsers.csv.CsvParserSettings;
 import it.roma.gtfs.gtfs_monitor.config.GtfsProperties;
+import it.roma.gtfs.gtfs_monitor.utils.StopNames;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
@@ -799,13 +800,77 @@ public class GtfsIndexService {
                 Integer locType = parseIntOrNull(r.getString("location_type"));
                 String parent = r.getString("parent_station");
 
-                out.put(id, new Stop(id, code, name, desc, lat, lon, url, wheel, timezone, locType, parent));
+                out.put(id, new Stop(id, code, name, desc, lat, lon, url, wheel, timezone, locType, parent,
+                        StopNames.isMissing(name)));
             }
             parser.stopParsing();
+            nameUnnamedStops(out);
             long ms = (System.nanoTime() - t0) / 1_000_000;
             log.debug("[GTFS-Index] Caricate {} stops in {} ms", out.size(), ms);
         }
         return out;
+    }
+
+    /**
+     * Entro questa distanza due stop_id sono di fatto la stessa palina. Nel feed
+     * del 2026-10-01 le coppie vere stanno a 1 m; la fermata con nome successiva
+     * piu' vicina a una senza nome e' a 25 m, gia' un altro punto della strada.
+     */
+    private static final double SAME_POLE_METERS = 10.0;
+
+    /**
+     * Da' un nome leggibile alle paline che nel feed ne sono prive.
+     *
+     * <p>ATAC pubblica alcune fermate vere (hanno coordinate e corse) con
+     * {@code stop_name = "_"}: nel feed del 2026-10-01 sono 15. Si normalizza qui,
+     * una volta sola al caricamento, cosi' ogni endpoint le restituisce gia' a
+     * posto invece di inoltrare "_" ai client.
+     *
+     * <p>Il nome non si inventa. Si prende quello di un'altra fermata solo quando
+     * sta sulla stessa palina (77185 e 31009 sono a 1 m da una fermata con nome).
+     * Le fermate soltanto "vicine" possono affacciarsi su un'altra via, e a 39 m
+     * dalla 71967 c'e' una "NON ATTIVA": per quelle resta il segnaposto di
+     * {@link StopNames#placeholder}, "Fermata" seguito dal codice.
+     */
+    private static void nameUnnamedStops(Map<String, Stop> stops) {
+        List<Stop> unnamed = stops.values().stream().filter(Stop::placeholderName).toList();
+        if (unnamed.isEmpty()) return;
+
+        List<Stop> named = stops.values().stream()
+                .filter(s -> !s.placeholderName() && s.lat() != null && s.lon() != null)
+                .filter(s -> !s.name().toUpperCase(Locale.ROOT).contains("NON ATTIVA"))
+                .toList();
+
+        int borrowed = 0;
+        for (Stop stop : unnamed) {
+            String samePoleName = nameOfStopOnSamePole(stop, named);
+            if (samePoleName != null) borrowed++;
+            stops.put(stop.id(), stop.renamed(
+                    samePoleName != null ? samePoleName : StopNames.placeholder(stop.code(), stop.id()),
+                    samePoleName == null));
+        }
+        log.info("[GTFS-Index] {} fermate senza nome nel feed: {} col nome della stessa palina, {} con segnaposto",
+                unnamed.size(), borrowed, unnamed.size() - borrowed);
+    }
+
+    /** Nome della fermata con nome piu' vicina, se sta sulla stessa palina; altrimenti null. */
+    private static String nameOfStopOnSamePole(Stop stop, List<Stop> named) {
+        if (stop.lat() == null || stop.lon() == null) return null;
+        // A queste distanze basta l'approssimazione piana: niente haversine.
+        double metersPerDegLat = 111_320.0;
+        double metersPerDegLon = metersPerDegLat * Math.cos(Math.toRadians(stop.lat()));
+        String best = null;
+        double bestMeters = SAME_POLE_METERS;
+        for (Stop other : named) {
+            double dy = (other.lat() - stop.lat()) * metersPerDegLat;
+            double dx = (other.lon() - stop.lon()) * metersPerDegLon;
+            double meters = Math.sqrt(dx * dx + dy * dy);
+            if (meters <= bestMeters) {
+                bestMeters = meters;
+                best = other.name();
+            }
+        }
+        return best;
     }
 
     private Map<String, Trip> loadTrips(Path p) throws IOException {
@@ -1875,8 +1940,15 @@ public class GtfsIndexService {
             Integer wheelchairBoarding,
             String timezone,
             Integer locationType,
-            String parentStation
-    ) {}
+            String parentStation,
+            // Vero se il feed non dava un nome e name e' il segnaposto "Fermata + codice".
+            boolean placeholderName
+    ) {
+        Stop renamed(String newName, boolean placeholder) {
+            return new Stop(id, code, newName, desc, lat, lon, url, wheelchairBoarding, timezone,
+                    locationType, parentStation, placeholder);
+        }
+    }
 
     public record Trip(
             String tripId,
