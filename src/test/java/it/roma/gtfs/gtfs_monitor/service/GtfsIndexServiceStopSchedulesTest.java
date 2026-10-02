@@ -16,6 +16,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -156,11 +157,19 @@ class GtfsIndexServiceStopSchedulesTest {
     @Test
     @DisplayName("gli orari non toccano la cache degli indici che usano arrivi e fermate vicine")
     void nonSvuotaLaCacheDelGiorno() throws Exception {
+        // Il warm-up avviato da rebuildIndexes() gira su un altro thread e mette in
+        // cache oggi e domani. Se finisse fra la fotografia e il confronto le chiavi
+        // cambierebbero senza che stopSchedules c'entri: lo si lascia finire prima.
+        service.awaitWarmup();
         Map<LocalDate, ?> prima = Map.copyOf(dateInCache());
+        // Il caso da proteggere e' proprio questo, cache piena dei giorni scaldati:
+        // a cache vuota il test non vedrebbe l'espulsione di oggi.
+        assertFalse(prima.isEmpty(), "il warm-up deve aver gia' messo in cache i suoi giorni");
+
         service.stopSchedules(GIORNO);
         // Prima il conto passava dalla cache per-data, che tiene solo tre giorni:
         // chiedere una data lontana buttava fuori quella di oggi. Ora la cache
-        // deve restare com'era — con dentro i giorni scaldati all'avvio, se ci sono.
+        // deve restare com'era, con dentro i giorni scaldati all'avvio.
         assertEquals(prima.keySet(), dateInCache().keySet(), "il calcolo non deve toccare la cache condivisa");
     }
 

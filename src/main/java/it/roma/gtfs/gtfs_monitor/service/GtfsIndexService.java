@@ -31,9 +31,12 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.*;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -222,6 +225,23 @@ public class GtfsIndexService {
         }
         log.info("[GTFS-Index] Warm-up indici per-data completato ({} giorni) in {} ms",
                 warmupDays, (System.nanoTime() - t0) / 1_000_000);
+    }
+
+    /**
+     * Aspetta che i warm-up accodati finora abbiano finito. Serve ai test che
+     * guardano la cache per-data: il warm-up ci scrive oggi e domani da un altro
+     * thread, e se lo fa a meta' test la cache cambia senza che c'entri il metodo
+     * sotto esame.
+     *
+     * L'executor ha un thread solo e una coda in ordine d'arrivo: un compito vuoto
+     * accodato adesso gira per forza dopo i warm-up gia' in coda.
+     */
+    void awaitWarmup() throws InterruptedException {
+        try {
+            warmupExecutor.submit(() -> { }).get(30, TimeUnit.SECONDS);
+        } catch (ExecutionException | TimeoutException e) {
+            throw new IllegalStateException("Warm-up degli indici per-data non concluso", e);
+        }
     }
 
     @PreDestroy
